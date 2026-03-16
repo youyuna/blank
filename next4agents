@@ -131,6 +131,43 @@ microassist_save_report <- function(prefix, context, body_text) {
   filename
 }
 
+microassist_choose_group_var <- function(meta_df,
+                                         requested_group_var = NULL,
+                                         priority_candidates = c("primaryTumorType", "SampleType", "sample_type", "group", "Group", "condition", "Condition", "Treatment", "treatment"),
+                                         min_non_missing = 3,
+                                         min_levels = 2,
+                                         max_levels = 20) {
+  if (is.null(meta_df) || nrow(meta_df) == 0 || ncol(meta_df) == 0) {
+    return(NULL)
+  }
+
+  is_valid_group <- function(x) {
+    keep <- !is.na(x) & x != ""
+    x <- x[keep]
+    if (length(x) < min_non_missing) return(FALSE)
+    nlev <- length(unique(x))
+    nlev >= min_levels && nlev <= max_levels
+  }
+
+  if (!is.null(requested_group_var) && requested_group_var %in% colnames(meta_df)) {
+    if (is_valid_group(meta_df[[requested_group_var]])) return(requested_group_var)
+  }
+
+  for (cand in priority_candidates) {
+    if (cand %in% colnames(meta_df) && is_valid_group(meta_df[[cand]])) return(cand)
+  }
+
+  for (nm in colnames(meta_df)) {
+    x <- meta_df[[nm]]
+    if (is.factor(x) || is.character(x) || is.logical(x)) {
+      if (is_valid_group(as.character(x))) return(nm)
+    }
+  }
+
+  NULL
+}
+
+
 # --- Main Function Dispatcher ---
 microbeassist_preprocessor <- function(ps,
                                        experimental_context,
@@ -309,19 +346,23 @@ microassist_alpha_insights_gemini <- function(ps,
   if (!inherits(ps, "phyloseq")) stop("Input 'ps' must be a phyloseq object.")
   api_key <- microassist_get_api_key(google_api_key, api_key_file)
 
-  alpha_df <- phyloseq::estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson"))
+  alpha_df <- phyloseq::estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson", "Chao1", "ACE"))
   sample_df <- as.data.frame(sample_data(ps))
 
-  group_summary <- "No grouping variable provided."
-  if (!is.null(group_var) && group_var %in% colnames(sample_df)) {
-    alpha_df$group <- sample_df[[group_var]]
+  selected_group_var <- microassist_choose_group_var(sample_df, requested_group_var = group_var)
+
+  group_summary <- "No valid grouping variable available for alpha diversity grouping."
+  if (!is.null(selected_group_var)) {
+    alpha_df[[selected_group_var]] <- sample_df[[selected_group_var]]
     group_stats <- alpha_df %>%
-      dplyr::group_by(group) %>%
+      dplyr::group_by(.data[[selected_group_var]]) %>%
       dplyr::summarise(
         n = dplyr::n(),
         Observed_mean = mean(Observed, na.rm = TRUE),
         Shannon_mean = mean(Shannon, na.rm = TRUE),
         Simpson_mean = mean(Simpson, na.rm = TRUE),
+        Chao1_mean = mean(Chao1, na.rm = TRUE),
+        ACE_mean = mean(ACE, na.rm = TRUE),
         .groups = "drop"
       )
     group_summary <- paste(capture.output(print(group_stats)), collapse = "\n")
@@ -352,7 +393,7 @@ microassist_alpha_insights_gemini <- function(ps,
 
   report_file <- microassist_save_report("microassist_alpha_diversity_insights", experimental_context, body)
 
-  list(insights = sections, alpha_metrics = alpha_df, report_file = report_file)
+  list(insights = sections, alpha_metrics = alpha_df, grouping_variable = selected_group_var, report_file = report_file)
 }
 
 # --- Agent 3: Beta Diversity Insights ---
@@ -377,10 +418,11 @@ microassist_beta_insights_gemini <- function(ps,
   top_variable_taxa <- sort(taxa_var, decreasing = TRUE)[1:min(20, length(taxa_var))]
 
   sample_df <- as.data.frame(sample_data(ps))
-  group_line <- if (!is.null(group_var) && group_var %in% colnames(sample_df)) {
-    paste0("Group variable: ", group_var, "; levels=", paste(unique(sample_df[[group_var]]), collapse = ", "))
+  selected_group_var <- microassist_choose_group_var(sample_df, requested_group_var = group_var)
+  group_line <- if (!is.null(selected_group_var)) {
+    paste0("Group variable: ", selected_group_var, "; levels=", paste(unique(sample_df[[selected_group_var]]), collapse = ", "))
   } else {
-    "No valid group variable provided."
+    "No valid grouping variable available for beta diversity grouping."
   }
 
   prompt <- paste0(
