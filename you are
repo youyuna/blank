@@ -423,7 +423,7 @@ microassist_generate_integrated_figures <- function(alpha_result,
     }
   }, silent = TRUE)
 
-  # Figure 3: top taxa bar chart
+  # Figure 3: overall top taxa bar chart
   try({
     tt <- taxonomic_result$top_table
     if (!is.null(tt) && nrow(tt) > 0) {
@@ -434,8 +434,27 @@ microassist_generate_integrated_figures <- function(alpha_result,
         geom_col(fill = "steelblue") +
         coord_flip() +
         theme_bw() +
-        labs(title = "Top Taxa Mean Relative Abundance", x = "Taxon", y = "Mean Relative Abundance")
-      fp <- file.path(output_dir, paste0(prefix, "_taxa_", stamp, ".png"))
+        labs(title = "Overall Top Taxa Mean Relative Abundance", x = "Taxon", y = "Mean Relative Abundance")
+      fp <- file.path(output_dir, paste0(prefix, "_taxa_overall_", stamp, ".png"))
+      ggsave(fp, p, width = 8, height = 6, dpi = 150)
+      out <- c(out, fp)
+    }
+  }, silent = TRUE)
+
+  # Figure 4: top taxa by group
+  try({
+    gtt <- taxonomic_result$group_top_table
+    gvar <- taxonomic_result$grouping_variable
+    if (!is.null(gtt) && nrow(gtt) > 0 && !is.null(gvar) && gvar %in% colnames(gtt)) {
+      gtt$taxon_label[is.na(gtt$taxon_label) | gtt$taxon_label == ""] <- gtt$taxon_id[is.na(gtt$taxon_label) | gtt$taxon_label == ""]
+      gtt$taxon_label <- factor(gtt$taxon_label, levels = rev(unique(gtt$taxon_label)))
+      p <- ggplot(gtt, aes(x = taxon_label, y = mean_relative_abundance, fill = .data[[gvar]])) +
+        geom_col(position = position_dodge(width = 0.9)) +
+        coord_flip() +
+        facet_wrap(as.formula(paste("~", gvar)), scales = "free_y") +
+        theme_bw() +
+        labs(title = "Top Taxa by Group", x = "Taxon", y = "Mean Relative Abundance", fill = gvar)
+      fp <- file.path(output_dir, paste0(prefix, "_taxa_by_group_", stamp, ".png"))
       ggsave(fp, p, width = 8, height = 6, dpi = 150)
       out <- c(out, fp)
     }
@@ -658,6 +677,7 @@ microassist_taxonomic_composition_agent <- function(ps,
                                                     experimental_context,
                                                     rank = "Phylum",
                                                     top_n = 15,
+                                                    group_var = NULL,
                                                     google_api_key = NULL,
                                                     api_key_file = "~/Documents/gemini_api_key_copy.txt",
                                                     model_name = "gemini-flash-latest",
@@ -676,6 +696,9 @@ microassist_taxonomic_composition_agent <- function(ps,
   if (!(rank %in% rank_names(ps))) {
     stop("Requested rank '", rank, "' not found. Available ranks: ", paste(rank_names(ps), collapse = ", "))
   }
+
+  meta_df <- as.data.frame(sample_data(ps))
+  selected_group_var <- microassist_choose_group_var(meta_df, requested_group_var = group_var)
 
   ps_rel <- microbiome::transform(ps, "compositional")
   ps_rank <- phyloseq::tax_glom(ps_rel, taxrank = rank, NArm = FALSE)
@@ -697,18 +720,48 @@ microassist_taxonomic_composition_agent <- function(ps,
     stringsAsFactors = FALSE
   )
 
+  group_top_table <- data.frame()
+  group_summary <- "No valid grouping variable available for group-level taxonomic analysis."
+  if (!is.null(selected_group_var) && selected_group_var %in% colnames(meta_df)) {
+    aligned_group <- as.character(meta_df[rownames(otu_rank), selected_group_var, drop = TRUE])
+    group_levels <- unique(aligned_group[!is.na(aligned_group) & aligned_group != ""])
+
+    group_tables <- lapply(group_levels, function(gl) {
+      idx <- aligned_group == gl
+      grp_mean <- rowMeans(otu_rank[, idx, drop = FALSE], na.rm = TRUE)
+      grp_top <- sort(grp_mean, decreasing = TRUE)[1:min(top_n, length(grp_mean))]
+      grp_ids <- names(grp_top)
+      grp_labels <- taxa_df[grp_ids, rank, drop = TRUE]
+      data.frame(
+        group = gl,
+        taxon_id = grp_ids,
+        taxon_label = as.character(grp_labels),
+        mean_relative_abundance = as.numeric(grp_top),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    group_top_table <- do.call(rbind, group_tables)
+    if (!is.null(group_top_table) && nrow(group_top_table) > 0) {
+      colnames(group_top_table)[colnames(group_top_table) == "group"] <- selected_group_var
+      group_summary <- paste(capture.output(print(utils::head(group_top_table, 30))), collapse = "\n")
+    }
+  }
+  
   prompt <- paste0(
     "You are a microbiome taxonomy expert. Interpret composition and prioritize targets for follow-up. ",
     "Return markdown ONLY with the exact headers:\n\n",
     "### Dominant Taxa and Biological Roles\n\n",
-    "### Deviations from Expected Composition\n\n",
+    "### Group-Level Taxonomic Differences\n\n",
     "### Priority Microbes for Follow-Up\n\n",
     "Context:\n", experimental_context, "\n\n",
     "Taxonomic rank analyzed: ", rank, "\n",
-    "Top taxa table:\n", paste(capture.output(print(top_table)), collapse = "\n"), "\n"
+    "Overall top taxa table:\n", paste(capture.output(print(top_table)), collapse = "\n"), "\n\n",
+    "Grouping variable used: ", ifelse(is.null(selected_group_var), "None", selected_group_var), "\n",
+    "Group-level top taxa preview:\n", group_summary, "\n"
   )
 
-  headers <- c("Dominant Taxa and Biological Roles", "Deviations from Expected Composition", "Priority Microbes for Follow-Up")
+  headers <- c("Dominant Taxa and Biological Roles", "Group-Level Taxonomic Differences", "Priority Microbes for Follow-Up")
   sections <- microassist_safe_llm_sections(
     prompt, headers, api_key, model_name, temperature, max_output_tokens,
     max_retries = llm_max_retries,
@@ -721,7 +774,9 @@ microassist_taxonomic_composition_agent <- function(ps,
     agent = "taxonomic_composition",
     sections = sections,
     rank = rank,
+    grouping_variable = selected_group_var,
     top_table = top_table,
+    group_top_table = group_top_table,
     report_file = report_file
   )
 }
@@ -732,6 +787,7 @@ microassist_taxonomic_composition_agent <- function(ps,
 
 microassist_integrated_report_agent <- function(experimental_context,
                                                 preprocessing_result,
+                                                group_var = NULL,
                                                 alpha_result,
                                                 beta_result,
                                                 taxonomic_result,
@@ -872,6 +928,7 @@ microassist_run_next4_agents <- function(ps,
     experimental_context = experimental_context,
     rank = rank,
     top_n = top_n,
+    group_var = group_var,
     google_api_key = google_api_key,
     api_key_file = api_key_file,
     model_name = model_name,
