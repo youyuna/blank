@@ -1,0 +1,530 @@
+```{r agents v5}
+# --- Load Necessary Libraries ---
+library(phyloseq)
+library(ggplot2)
+library(microbiome)
+library(httr)
+library(RJSONIO)
+library(stats)
+library(dplyr)
+
+# --- Shared Helpers ---
+
+microassist_get_api_key <- function(google_api_key = NULL,
+                                    api_key_file = "/Users/data/api_keys.txt") {
+  if (!is.null(api_key_file)) {
+    if (!file.exists(api_key_file)) {
+      stop("API key file '", api_key_file, "' not found. Please provide a valid path.")
+    }
+    api_key <- readLines(api_key_file, n = 1, warn = FALSE)
+    if (nchar(api_key) == 0) {
+      stop("API key file '", api_key_file, "' is empty.")
+    }
+    return(api_key)
+  }
+
+  if (!is.null(google_api_key) && nchar(google_api_key) > 0) {
+    return(google_api_key)
+  }
+
+  stop("Either 'google_api_key' or 'api_key_file' must be provided.")
+}
+
+microassist_call_gemini <- function(prompt_text,
+                                    api_key,
+                                    model_name = "gemini-1.5-flash-latest",
+                                    temperature = 0,
+                                    max_output_tokens = 8192) {
+  api_endpoint_url <- paste0(
+    "https://generativelanguage.googleapis.com/v1beta/models/",
+    model_name,
+    ":generateContent"
+  )
+
+  request_body <- list(
+    contents = list(list(parts = list(list(text = prompt_text)))),
+    generationConfig = list(
+      temperature = temperature,
+      maxOutputTokens = max_output_tokens
+    )
+  )
+
+  response <- tryCatch({
+    httr::POST(
+      url = api_endpoint_url,
+      httr::add_headers(.headers = c("Content-Type" = "application/json")),
+      query = list(key = api_key),
+      body = RJSONIO::toJSON(request_body, auto_unbox = TRUE),
+      encode = "json"
+    )
+  }, error = function(e) {
+    stop("Google Gemini API call failed: ", e$message, call. = FALSE)
+  })
+
+  if (httr::http_error(response)) {
+    response_text <- httr::content(response, "text")
+    stop(
+      paste0(
+        "Google Gemini API request failed with status ",
+        httr::status_code(response),
+        ". Response: ",
+        response_text
+      ),
+      call. = FALSE
+    )
+  }
+
+  response_content <- httr::content(response, "parsed")
+  if (is.null(response_content$candidates) || length(response_content$candidates) == 0) {
+    stop("No valid candidates found in LLM response.", call. = FALSE)
+  }
+
+  parts <- response_content$candidates[[1]]$content$parts
+  if (is.null(parts) || length(parts) == 0) {
+    stop("LLM response candidates found, but content/parts are missing.", call. = FALSE)
+  }
+
+  part_texts <- sapply(parts, function(part) if (!is.null(part$text)) part$text else NA_character_)
+  llm_raw_response_text <- paste(na.omit(part_texts), collapse = "\n")
+
+  if (nchar(llm_raw_response_text) == 0) {
+    stop("LLM response was received but contained no extractable text.", call. = FALSE)
+  }
+
+  llm_raw_response_text
+}
+
+microassist_extract_sections <- function(text, headers) {
+  sections <- list()
+  for (i in seq_along(headers)) {
+    this_header <- headers[[i]]
+    next_header <- if (i < length(headers)) headers[[i + 1]] else NULL
+
+    if (is.null(next_header)) {
+      pattern <- paste0("(?s)### ", this_header, "\\n\\n(.*)$")
+    } else {
+      pattern <- paste0("(?s)### ", this_header, "\\n\\n(.*?)(?:\\n\\n### ", next_header, "|$)")
+    }
+
+    m <- regmatches(text, regexec(pattern, text, perl = TRUE, ignore.case = TRUE))
+    if (length(m) > 0 && length(m[[1]]) > 1) {
+      sections[[this_header]] <- trimws(m[[1]][2])
+    } else {
+      sections[[this_header]] <- paste0("Error: Could not extract '", this_header, "' section.")
+    }
+  }
+  sections
+}
+
+microassist_save_report <- function(prefix, context, body_text) {
+  timestamp_str <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  filename <- paste0(prefix, "_", timestamp_str, ".txt")
+
+  full_text <- paste0(
+    "Timestamp: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n",
+    "--- Experimental Context ---\n", context, "\n\n",
+    body_text, "\n"
+  )
+
+  writeLines(full_text, filename)
+  message("Saved report: ", filename)
+  filename
+}
+
+# --- Main Function Dispatcher ---
+microbeassist_preprocessor <- function(ps,
+                                       experimental_context,
+                                       llm_server = "google",
+                                       google_api_key = NULL,
+                                       api_key_file = NULL,
+                                       model_name = "gemini-1.5-flash-latest",
+                                       temperature = 0,
+                                       max_output_tokens = 8192) {
+  if (llm_server != "google") {
+    stop("Only the 'google' llm_server is supported in this version.")
+  }
+
+  microassist_preprocessor_gemini(
+    ps = ps,
+    experimental_context = experimental_context,
+    google_api_key = google_api_key,
+    api_key_file = api_key_file,
+    model_name = model_name,
+    temperature = temperature,
+    max_output_tokens = max_output_tokens
+  )
+}
+
+microbeassist_run_agent <- function(agent,
+                                    ps = NULL,
+                                    experimental_context,
+                                    llm_server = "google",
+                                    google_api_key = NULL,
+                                    api_key_file = NULL,
+                                    model_name = "gemini-1.5-flash-latest",
+                                    temperature = 0,
+                                    max_output_tokens = 8192,
+                                    ...) {
+  if (llm_server != "google") {
+    stop("Only the 'google' llm_server is supported in this version.")
+  }
+
+  agent <- tolower(agent)
+  if (agent == "preprocessing") {
+    return(microassist_preprocessor_gemini(
+      ps = ps,
+      experimental_context = experimental_context,
+      google_api_key = google_api_key,
+      api_key_file = api_key_file,
+      model_name = model_name,
+      temperature = temperature,
+      max_output_tokens = max_output_tokens
+    ))
+  }
+  if (agent == "alpha_diversity") {
+    return(microassist_alpha_insights_gemini(
+      ps = ps,
+      experimental_context = experimental_context,
+      google_api_key = google_api_key,
+      api_key_file = api_key_file,
+      model_name = model_name,
+      temperature = temperature,
+      max_output_tokens = max_output_tokens,
+      ...
+    ))
+  }
+  if (agent == "beta_diversity") {
+    return(microassist_beta_insights_gemini(
+      ps = ps,
+      experimental_context = experimental_context,
+      google_api_key = google_api_key,
+      api_key_file = api_key_file,
+      model_name = model_name,
+      temperature = temperature,
+      max_output_tokens = max_output_tokens,
+      ...
+    ))
+  }
+  if (agent == "taxonomic_composition") {
+    return(microassist_taxonomic_insights_gemini(
+      ps = ps,
+      experimental_context = experimental_context,
+      google_api_key = google_api_key,
+      api_key_file = api_key_file,
+      model_name = model_name,
+      temperature = temperature,
+      max_output_tokens = max_output_tokens,
+      ...
+    ))
+  }
+  if (agent == "integrated_report") {
+    return(microassist_integrated_report_gemini(
+      experimental_context = experimental_context,
+      google_api_key = google_api_key,
+      api_key_file = api_key_file,
+      model_name = model_name,
+      temperature = temperature,
+      max_output_tokens = max_output_tokens,
+      ...
+    ))
+  }
+
+  stop("Unknown agent. Use one of: preprocessing, alpha_diversity, beta_diversity, taxonomic_composition, integrated_report")
+}
+
+# --- Agent 1: Preprocessing Recommendations ---
+microassist_preprocessor_gemini <- function(ps,
+                                            experimental_context,
+                                            google_api_key = NULL,
+                                            api_key_file = "/Users/data/api_keys.txt",
+                                            model_name = "gemini-1.5-flash-latest",
+                                            temperature = 0,
+                                            max_output_tokens = 8192) {
+  if (!inherits(ps, "phyloseq")) stop("Input 'ps' must be a phyloseq object.")
+  if (is.null(experimental_context) || nchar(experimental_context) == 0) {
+    stop("Input 'experimental_context' must be a non-empty character string.")
+  }
+
+  api_key <- microassist_get_api_key(google_api_key, api_key_file)
+
+  otu <- as(otu_table(ps), "matrix")
+  if (!taxa_are_rows(ps)) otu <- t(otu)
+
+  sample_total_counts <- colSums(otu)
+  sample_feature_richness <- apply(otu, 2, function(x) sum(x > 0))
+  feature_prevalence <- apply(otu, 1, function(x) mean(x > 0))
+  sparsity <- sum(otu == 0) / length(otu)
+
+  fmt_q <- function(x) paste0("q05=", round(quantile(x, 0.05), 3), ", q50=", round(quantile(x, 0.50), 3), ", q95=", round(quantile(x, 0.95), 3))
+
+  prompt <- paste0(
+    "You are a microbiome preprocessing expert.\n",
+    "Return markdown only starting with: Based on the provided microbiome dataset characteristics and experimental context, here are my preprocessing recommendations:\n\n",
+    "### Feature Filtering\n\n",
+    "### Normalization Method\n\n",
+    "### Overall Summary\n\n",
+    "Context: ", experimental_context, "\n",
+    "Samples=", nsamples(ps), ", Features=", ntaxa(ps), "\n",
+    "Sample counts quantiles: ", fmt_q(sample_total_counts), "\n",
+    "Feature richness quantiles: ", fmt_q(sample_feature_richness), "\n",
+    "Feature prevalence quantiles: ", fmt_q(feature_prevalence), "\n",
+    "Sparsity=", round(sparsity, 4), "\n"
+  )
+
+  llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
+  sections <- microassist_extract_sections(llm_text, c("Feature Filtering", "Normalization Method", "Overall Summary"))
+
+  body <- paste0(
+    "--- Preprocessing Recommendations ---\n\n",
+    "### Feature Filtering\n", sections[["Feature Filtering"]], "\n\n",
+    "### Normalization Method\n", sections[["Normalization Method"]], "\n\n",
+    "### Overall Summary\n", sections[["Overall Summary"]]
+  )
+
+  report_file <- microassist_save_report("microassist_preprocessing_recommendations", experimental_context, body)
+
+  list(
+    recommendations = sections,
+    generated_metrics = list(
+      num_samples = nsamples(ps),
+      num_features = ntaxa(ps),
+      sample_total_counts = summary(sample_total_counts),
+      sample_feature_richness = summary(sample_feature_richness),
+      feature_prevalence = summary(feature_prevalence),
+      dataset_sparsity = sparsity
+    ),
+    report_file = report_file
+  )
+}
+
+# --- Agent 2: Alpha Diversity Insights ---
+microassist_alpha_insights_gemini <- function(ps,
+                                               experimental_context,
+                                               group_var = NULL,
+                                               google_api_key = NULL,
+                                               api_key_file = "/Users/data/api_keys.txt",
+                                               model_name = "gemini-1.5-flash-latest",
+                                               temperature = 0,
+                                               max_output_tokens = 8192) {
+  if (!inherits(ps, "phyloseq")) stop("Input 'ps' must be a phyloseq object.")
+  api_key <- microassist_get_api_key(google_api_key, api_key_file)
+
+  alpha_df <- phyloseq::estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson"))
+  sample_df <- as.data.frame(sample_data(ps))
+
+  group_summary <- "No grouping variable provided."
+  if (!is.null(group_var) && group_var %in% colnames(sample_df)) {
+    alpha_df$group <- sample_df[[group_var]]
+    group_stats <- alpha_df %>%
+      dplyr::group_by(group) %>%
+      dplyr::summarise(
+        n = dplyr::n(),
+        Observed_mean = mean(Observed, na.rm = TRUE),
+        Shannon_mean = mean(Shannon, na.rm = TRUE),
+        Simpson_mean = mean(Simpson, na.rm = TRUE),
+        .groups = "drop"
+      )
+    group_summary <- paste(capture.output(print(group_stats)), collapse = "\n")
+  }
+
+  prompt <- paste0(
+    "You are an expert microbiome ecologist. Interpret alpha diversity biologically. Return markdown only with sections:\n",
+    "### Alpha Diversity Interpretation\n\n",
+    "### Group Differences and Mechanisms\n\n",
+    "### Hypotheses for Follow-Up\n\n",
+    "Context: ", experimental_context, "\n\n",
+    "Overall alpha diversity summary:\n", paste(capture.output(summary(alpha_df)), collapse = "\n"), "\n\n",
+    "Group summary:\n", group_summary
+  )
+
+  llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
+  sections <- microassist_extract_sections(
+    llm_text,
+    c("Alpha Diversity Interpretation", "Group Differences and Mechanisms", "Hypotheses for Follow-Up")
+  )
+
+  body <- paste0(
+    "--- Alpha Diversity Insights ---\n\n",
+    "### Alpha Diversity Interpretation\n", sections[["Alpha Diversity Interpretation"]], "\n\n",
+    "### Group Differences and Mechanisms\n", sections[["Group Differences and Mechanisms"]], "\n\n",
+    "### Hypotheses for Follow-Up\n", sections[["Hypotheses for Follow-Up"]]
+  )
+
+  report_file <- microassist_save_report("microassist_alpha_diversity_insights", experimental_context, body)
+
+  list(insights = sections, alpha_metrics = alpha_df, report_file = report_file)
+}
+
+# --- Agent 3: Beta Diversity Insights ---
+microassist_beta_insights_gemini <- function(ps,
+                                              experimental_context,
+                                              group_var = NULL,
+                                              distance_method = "bray",
+                                              google_api_key = NULL,
+                                              api_key_file = "/Users/data/api_keys.txt",
+                                              model_name = "gemini-1.5-flash-latest",
+                                              temperature = 0,
+                                              max_output_tokens = 8192) {
+  if (!inherits(ps, "phyloseq")) stop("Input 'ps' must be a phyloseq object.")
+  api_key <- microassist_get_api_key(google_api_key, api_key_file)
+
+  dist_obj <- phyloseq::distance(ps, method = distance_method)
+  ord <- phyloseq::ordinate(ps, method = "PCoA", distance = dist_obj)
+
+  otu <- as(otu_table(ps), "matrix")
+  if (!taxa_are_rows(ps)) otu <- t(otu)
+  taxa_var <- apply(otu, 1, var)
+  top_variable_taxa <- sort(taxa_var, decreasing = TRUE)[1:min(20, length(taxa_var))]
+
+  sample_df <- as.data.frame(sample_data(ps))
+  group_line <- if (!is.null(group_var) && group_var %in% colnames(sample_df)) {
+    paste0("Group variable: ", group_var, "; levels=", paste(unique(sample_df[[group_var]]), collapse = ", "))
+  } else {
+    "No valid group variable provided."
+  }
+
+  prompt <- paste0(
+    "You are a microbiome community ecology expert. Interpret beta diversity and drivers of separation. Return markdown only with sections:\n",
+    "### Community Separation Interpretation\n\n",
+    "### Likely Drivers of Dissimilarity\n\n",
+    "### Hypotheses on Community Structure\n\n",
+    "Context: ", experimental_context, "\n",
+    group_line, "\n\n",
+    "Distance summary:\n", paste(capture.output(summary(dist_obj)), collapse = "\n"), "\n\n",
+    "Ordination eigenvalues:\n", paste(capture.output(print(ord$values$Eigenvalues[1:min(5, length(ord$values$Eigenvalues))])), collapse = "\n"), "\n\n",
+    "Top variable taxa (variance):\n", paste(capture.output(print(top_variable_taxa)), collapse = "\n")
+  )
+
+  llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
+  sections <- microassist_extract_sections(
+    llm_text,
+    c("Community Separation Interpretation", "Likely Drivers of Dissimilarity", "Hypotheses on Community Structure")
+  )
+
+  body <- paste0(
+    "--- Beta Diversity Insights ---\n\n",
+    "### Community Separation Interpretation\n", sections[["Community Separation Interpretation"]], "\n\n",
+    "### Likely Drivers of Dissimilarity\n", sections[["Likely Drivers of Dissimilarity"]], "\n\n",
+    "### Hypotheses on Community Structure\n", sections[["Hypotheses on Community Structure"]]
+  )
+
+  report_file <- microassist_save_report("microassist_beta_diversity_insights", experimental_context, body)
+
+  list(insights = sections, distance = dist_obj, ordination = ord, top_variable_taxa = top_variable_taxa, report_file = report_file)
+}
+
+# --- Agent 4: Taxonomic Composition Insights ---
+microassist_taxonomic_insights_gemini <- function(ps,
+                                                   experimental_context,
+                                                   rank = "Phylum",
+                                                   top_n = 15,
+                                                   google_api_key = NULL,
+                                                   api_key_file = "/Users/data/api_keys.txt",
+                                                   model_name = "gemini-1.5-flash-latest",
+                                                   temperature = 0,
+                                                   max_output_tokens = 8192) {
+  if (!inherits(ps, "phyloseq")) stop("Input 'ps' must be a phyloseq object.")
+  api_key <- microassist_get_api_key(google_api_key, api_key_file)
+
+  available_ranks <- rank_names(ps)
+  if (!(rank %in% available_ranks)) {
+    stop("Requested rank '", rank, "' is not available. Available ranks: ", paste(available_ranks, collapse = ", "))
+  }
+
+  ps_rel <- microbiome::transform(ps, "compositional")
+  ps_rank <- phyloseq::tax_glom(ps_rel, taxrank = rank, NArm = FALSE)
+  otu_rank <- as(otu_table(ps_rank), "matrix")
+  if (!taxa_are_rows(ps_rank)) otu_rank <- t(otu_rank)
+
+  mean_abundance <- rowMeans(otu_rank, na.rm = TRUE)
+  top_taxa <- sort(mean_abundance, decreasing = TRUE)[1:min(top_n, length(mean_abundance))]
+
+  taxa_df <- as.data.frame(tax_table(ps_rank))
+  taxa_names_vec <- names(top_taxa)
+  top_labels <- taxa_df[taxa_names_vec, rank, drop = TRUE]
+  top_table <- data.frame(
+    taxon_id = taxa_names_vec,
+    label = as.character(top_labels),
+    mean_relative_abundance = as.numeric(top_taxa),
+    stringsAsFactors = FALSE
+  )
+
+  prompt <- paste0(
+    "You are an expert in microbiome taxonomic interpretation. Return markdown only with sections:\n",
+    "### Dominant Taxa and Biological Roles\n\n",
+    "### Deviations from Expected Composition\n\n",
+    "### Priority Taxa for Investigation\n\n",
+    "Context: ", experimental_context, "\n",
+    "Taxonomic rank analyzed: ", rank, "\n\n",
+    "Top taxa table:\n", paste(capture.output(print(top_table)), collapse = "\n")
+  )
+
+  llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
+  sections <- microassist_extract_sections(
+    llm_text,
+    c("Dominant Taxa and Biological Roles", "Deviations from Expected Composition", "Priority Taxa for Investigation")
+  )
+
+  body <- paste0(
+    "--- Taxonomic Composition Insights ---\n\n",
+    "### Dominant Taxa and Biological Roles\n", sections[["Dominant Taxa and Biological Roles"]], "\n\n",
+    "### Deviations from Expected Composition\n", sections[["Deviations from Expected Composition"]], "\n\n",
+    "### Priority Taxa for Investigation\n", sections[["Priority Taxa for Investigation"]]
+  )
+
+  report_file <- microassist_save_report("microassist_taxonomic_composition_insights", experimental_context, body)
+
+  list(insights = sections, top_taxa_table = top_table, report_file = report_file)
+}
+
+# --- Agent 5: Integrated Analysis Report ---
+microassist_integrated_report_gemini <- function(experimental_context,
+                                                  preprocessing_output = NULL,
+                                                  alpha_output = NULL,
+                                                  beta_output = NULL,
+                                                  taxonomic_output = NULL,
+                                                  google_api_key = NULL,
+                                                  api_key_file = "/Users/data/api_keys.txt",
+                                                  model_name = "gemini-1.5-flash-latest",
+                                                  temperature = 0,
+                                                  max_output_tokens = 8192) {
+  api_key <- microassist_get_api_key(google_api_key, api_key_file)
+
+  safe_capture <- function(x) {
+    if (is.null(x)) return("Not provided")
+    paste(capture.output(str(x, max.level = 2)), collapse = "\n")
+  }
+
+  prompt <- paste0(
+    "You are generating an integrated microbiome analysis report for scientists. Return markdown only with sections:\n",
+    "### Executive Summary\n\n",
+    "### Cross-Analysis Synthesis\n\n",
+    "### Actionable Biological Hypotheses\n\n",
+    "### Suggested Validation and Next Analyses\n\n",
+    "Context: ", experimental_context, "\n\n",
+    "Preprocessing output:\n", safe_capture(preprocessing_output), "\n\n",
+    "Alpha output:\n", safe_capture(alpha_output), "\n\n",
+    "Beta output:\n", safe_capture(beta_output), "\n\n",
+    "Taxonomic output:\n", safe_capture(taxonomic_output), "\n"
+  )
+
+  llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
+  sections <- microassist_extract_sections(
+    llm_text,
+    c("Executive Summary", "Cross-Analysis Synthesis", "Actionable Biological Hypotheses", "Suggested Validation and Next Analyses")
+  )
+
+  body <- paste0(
+    "--- Integrated Microbiome Analysis Report ---\n\n",
+    "### Executive Summary\n", sections[["Executive Summary"]], "\n\n",
+    "### Cross-Analysis Synthesis\n", sections[["Cross-Analysis Synthesis"]], "\n\n",
+    "### Actionable Biological Hypotheses\n", sections[["Actionable Biological Hypotheses"]], "\n\n",
+    "### Suggested Validation and Next Analyses\n", sections[["Suggested Validation and Next Analyses"]]
+  )
+
+  report_file <- microassist_save_report("microassist_integrated_analysis_report", experimental_context, body)
+
+  list(report_sections = sections, report_file = report_file)
+}
+
+```
