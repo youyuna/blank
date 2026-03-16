@@ -1,0 +1,461 @@
+```{r chunk 1}
+# --- Load Necessary Libraries ---
+library(phyloseq)
+library(ggplot2)
+library(microbiome)
+library(httr)
+library(RJSONIO) # Used for toJSON
+library(stats)   # For quantile, summary
+library(dplyr)   # For data manipulation
+
+
+# --- Main Function Dispatcher ---
+microbeassist_preprocessor <- function(ps,
+                                     experimental_context,
+                                     llm_server = "google",
+                                     google_api_key = NULL,
+                                     api_key_file = "~/Documents/gemini_api_key_copy.txt",
+                                     model_name = "gemini-flash-latest",
+                                     temperature = 0,
+                                     max_output_tokens = 8192) {
+  
+  if (llm_server == "google") {
+    return(microassist_preprocessor_gemini(
+      ps = ps,
+      experimental_context = experimental_context,
+      google_api_key = google_api_key,
+      api_key_file = api_key_file,
+      model_name = model_name,
+      temperature = temperature,
+      max_output_tokens = max_output_tokens
+    ))
+  } else {
+    stop("Only the 'google' llm_server is supported in this version.")
+  }
+}
+
+#' @title MicroAssist Preprocessing Assistant (Gemini Focused, Markdown Output)
+#'
+#' @description
+#' Analyzes a phyloseq object and recommends preprocessing steps (filtering, normalization)
+#' using Google Gemini LLM via direct R API calls (httr). It calculates microbiome-specific metrics and
+#' contextualizes recommendations with experimental design information. The LLM is instructed to
+#' output recommendations in a structured Markdown format. The function then prints this
+#' structured output to the console and saves it to a text file.
+#'
+#' @author [Your Name/Team Name]
+#'
+#' @param ps A phyloseq object containing the microbiome data (OTU/ASV table and metadata).
+#' @param experimental_context A free-form string describing the experimental design,
+#'   biological question, or metadata variables of interest. E.g., "Comparing gut microbiome of patients with
+#'   Inflammatory Bowel Disease (IBD) vs. healthy controls, focusing on differences
+#'   in microbial diversity and composition over time."
+#' @param google_api_key Your Google Gemini API key. Alternatively, provide the path to a file
+#'   containing the key via `api_key_file`.
+#' @param api_key_file Path to a file containing your Google Gemini API key. If provided,
+#'   `google_api_key` is ignored. Defaults to "/Users/data/api_keys.txt" if not specified.
+#' @param model_name The specific Google Gemini model to use. Default is "gemini-1.5-flash-latest".
+#' @param temperature Numeric value between 0 and 1, controlling LLM creativity. Default is 0 (for deterministic output).
+#' @param max_output_tokens Integer specifying the maximum tokens for LLM output. Default is 8192.
+#'
+#' @return The path to the saved report file, invisibly. The output is also printed to the console.
+#'
+#' @usage
+#' # To use this function:
+#' # 1. Ensure you have your Google Gemini API key saved in '/Users/data/api_keys.txt'
+#' #    or provide it directly via the 'google_api_key' argument.
+#' # 2. Have your phyloseq object 'my_ps_object' ready.
+#' # 3. Define your experimental context string.
+#'
+#' # Example:
+#' # my_ps_object <- load_my_microbiome_data() # Replace with your data loading code
+#' # my_context <- "Investigating gut microbiome changes in response to a novel probiotic intervention in human subjects. Focus is on identifying key drivers of dysbiosis and potential markers."
+#' #
+#' # report_file_path <- microassist_preprocessor_gemini(
+#' #   ps = my_ps_object,
+#' #   experimental_context = my_context,
+#' #   api_key_file = "/Users/data/api_keys.txt", # Your API key file path
+#' #   model_name = "gemini-1.5-flash-latest",
+#' #   temperature = 0.2
+#' # )
+#' # print(report_file_path)
+#'
+#' @import phyloseq
+#' @import ggplot2
+#' @import microbiome
+#' @import jsonlite
+#' @import httr
+#' @import RJSONIO
+#' @import stats
+#' @import dplyr
+#'
+#' @export
+
+microassist_preprocessor_gemini <- function(ps,
+                                            experimental_context,
+                                            google_api_key = NULL,
+                                            api_key_file = "~/Documents/gemini_api_key_copy.txt", # Default API key file location
+                                            model_name = "gemini-flash-latest",
+                                            temperature = 0,
+                                            max_output_tokens = 8192) {
+  
+  # --- 1. Input Validation and Setup ---
+  if (!inherits(ps, "phyloseq")) {
+    stop("Input 'ps' must be a phyloseq object.")
+  }
+  if (is.null(experimental_context) || !is.character(experimental_context) || nchar(experimental_context) == 0) {
+    stop("Input 'experimental_context' must be a non-empty character string.")
+  }
+  
+  # API Key Handling
+  api_key <- NULL
+  if (!is.null(api_key_file)) {
+    if (file.exists(api_key_file)) {
+      api_key <- readLines(api_key_file, n = 1, warn = FALSE)
+      if (nchar(api_key) == 0) {
+        stop("API key file '", api_key_file, "' is empty.")
+      }
+    } else {
+      stop("API key file '", api_key_file, "' not found. Please provide a valid path.")
+    }
+  } else if (!is.null(google_api_key)) {
+    api_key <- google_api_key
+  } else {
+    stop("Either 'google_api_key' or 'api_key_file' must be provided.")
+  }
+  
+  # --- 2. Generate Relevant Microbiome-Specific Metrics & Metadata ---
+  message("1. Calculating microbiome-specific metrics...")
+  
+  microbiome_metrics <- list()
+  
+  # Dataset Dimensions
+  microbiome_metrics$dataset_dimensions <- list(
+    num_samples = nsamples(ps),
+    num_features = ntaxa(ps) # Features = OTUs/ASVs/Taxa
+  )
+  
+  # Abundance Table Access
+  otu_table_counts <- otu_table(ps)@.Data
+  
+  # Sample-wise Metrics
+  sample_total_counts <- colSums(otu_table_counts)
+  sample_feature_richness <- apply(otu_table_counts, 2, function(x) sum(x > 0))
+  
+  microbiome_metrics$sample_level_metrics <- list(
+    total_counts = list(
+      summary = summary(sample_total_counts),
+      quantiles = list(
+        q05 = quantile(sample_total_counts, probs = 0.05),
+        q50 = quantile(sample_total_counts, probs = 0.50),
+        q95 = quantile(sample_total_counts, probs = 0.95)
+      )
+    ),
+    feature_richness = list(
+      summary = summary(sample_feature_richness),
+      quantiles = list(
+        q05 = quantile(sample_feature_richness, probs = 0.05),
+        q50 = quantile(sample_feature_richness, probs = 0.50),
+        q95 = quantile(sample_feature_richness, probs = 0.95)
+      )
+    )
+  )
+  
+  # Feature Prevalence Metrics
+  feature_detection_prevalence <- apply(otu_table_counts, 1, function(x) sum(x > 0) / ncol(otu_table_counts))
+  microbiome_metrics$feature_prevalence <- list(
+    summary = summary(feature_detection_prevalence),
+    quantiles = list(
+      q05 = quantile(feature_detection_prevalence, probs = 0.05),
+      q50 = quantile(feature_detection_prevalence, probs = 0.50),
+      q95 = quantile(feature_detection_prevalence, probs = 0.95)
+    )
+  )
+  
+  # Dataset Sparsity
+  total_observations <- microbiome_metrics$dataset_dimensions$num_samples * microbiome_metrics$dataset_dimensions$num_features
+  total_zeros <- sum(otu_table_counts == 0)
+  microbiome_metrics$dataset_sparsity <- total_zeros / total_observations
+  
+  # --- 3. Construct LLM Prompt ---
+  message("2. Constructing prompt for LLM...")
+  
+  format_summary <- function(summary_vec) {
+    if (is.null(summary_vec)) return("N/A")
+    paste(names(summary_vec), round(summary_vec, 3), sep = ": ", collapse = "; ")
+  }
+  
+  format_quantiles <- function(quantiles_list) {
+    if (is.null(quantiles_list)) return("N/A")
+    paste0("q05=", round(quantiles_list$q05, 3), 
+           ", q50=", round(quantiles_list$q50, 3), 
+           ", q95=", round(quantiles_list$q95, 3))
+  }
+  
+  prompt_parts <- list()
+  
+  prompt_parts[["header"]] <- "I am analyzing microbiome data using R and the phyloseq package. My goal is to get expert recommendations for data preprocessing, specifically filtering and normalization. Provide your recommendations in a structured markdown format, with the following sections:\n\n### Feature Filtering\n\n[Your detailed recommendations for prevalence thresholds and sample filtering, including rationale and trade-offs.]\n\n### Normalization Method\n\n[Your detailed explanation and recommendation for normalization methods (e.g., TSS, CLR), including justifications.]\n\n### Overall Summary\n\n[A concise summary of the recommended preprocessing pipeline.]\n\nDo NOT include any R code, next steps, or conversational text. Start the entire response with 'Based on the provided microbiome dataset characteristics and experimental context, here are my preprocessing recommendations:'. Ensure the response is well-formatted markdown."
+  
+  prompt_parts[["context"]] <- paste0("**Experimental Context:**\n", experimental_context, "\n")
+  
+  prompt_parts[["dataset_dims"]] <- paste0(
+    "**Microbiome Dataset Characteristics:**\n",
+    "  **Dimensions:**\n",
+    "    - Number of Samples: ", microbiome_metrics$dataset_dimensions$num_samples, "\n",
+    "    - Number of Features (OTUs/ASVs): ", microbiome_metrics$dataset_dimensions$num_features, "\n\n"
+  )
+  
+  prompt_parts[["sample_metrics"]] <- paste0(
+    "  **Sample-Level Metrics:**\n",
+    "    - Total Counts per Sample (analogous to library size):\n",
+    "      Summary: ", format_summary(microbiome_metrics$sample_level_metrics$total_counts$summary), "\n",
+    "      Quantiles (5%, 50%, 95%): ", format_quantiles(microbiome_metrics$sample_level_metrics$total_counts$quantiles), "\n",
+    "    - Feature Richness per Sample (number of unique features detected):\n",
+    "      Summary: ", format_summary(microbiome_metrics$sample_level_metrics$feature_richness$summary), "\n",
+    "      Quantiles (5%, 50%, 95%): ", format_quantiles(microbiome_metrics$sample_level_metrics$feature_richness$quantiles), "\n\n"
+  )
+  
+  prompt_parts[["feature_metrics"]] <- paste0(
+    "  **Feature-Level Metrics:**\n",
+    "    - Feature Detection Prevalence (proportion of samples a feature is detected in):\n",
+    "      Summary: ", format_summary(microbiome_metrics$feature_prevalence$summary), "\n",
+    "      Quantiles (5%, 50%, 95%): ", format_quantiles(microbiome_metrics$feature_prevalence$quantiles), "\n\n"
+  )
+  
+  prompt_parts[["sparsity"]] <- paste0(
+    "  **Dataset Sparsity:**\n",
+    "    - Proportion of zero counts in the entire dataset: ", round(microbiome_metrics$dataset_sparsity, 4), "\n\n"
+  )
+  
+  # The LLM task now focuses solely on providing markdown-formatted recommendations
+  prompt_parts[["llm_task"]] <- paste0(
+    "**LLM Task: Preprocessing Recommendations in Markdown Format**\n",
+    "Based on this dataset's characteristics and my experimental context, provide specific, actionable recommendations for preprocessing steps (feature filtering and normalization).",
+    "Your ENTIRE response MUST be in markdown format and begin with the exact phrase: 'Based on the provided microbiome dataset characteristics and experimental context, here are my preprocessing recommendations:'. It must then include the following sections using exact markdown headers:\n",
+    "\n### Feature Filtering\n",
+    "[Your detailed recommendations for prevalence thresholds and sample filtering, including rationale and trade-offs.]\n",
+    "\n### Normalization Method\n",
+    "[Your detailed explanation and recommendation for normalization methods (e.g., TSS, CLR), including justifications.]\n",
+    "\n### Overall Summary\n",
+    "[A concise summary of the recommended preprocessing pipeline.]\n",
+    "\nDo NOT include any R code, next steps, or conversational text outside of these markdown sections. Ensure the output is strictly markdown."
+  )
+  
+  # Combine all prompt parts
+  final_prompt_text <- paste(
+    prompt_parts$header,
+    prompt_parts$context,
+    prompt_parts$dataset_dims,
+    prompt_parts$sample_metrics,
+    prompt_parts$feature_metrics,
+    prompt_parts$sparsity,
+    prompt_parts$llm_task,
+    sep = "\n"
+  )
+  
+  message("3. Calling Google Gemini API...")
+  
+  # --- 4. Call the Google Gemini LLM ---
+  
+  api_endpoint_url <- paste0("https://generativelanguage.googleapis.com/v1beta/models/", model_name, ":generateContent")
+  
+  request_body <- list(
+    contents = list(
+      list(
+        parts = list(
+          list(text = final_prompt_text)
+        )
+      )
+    ),
+    generationConfig = list(
+      temperature = temperature,
+      maxOutputTokens = max_output_tokens
+    )
+  )
+  
+  query_params <- list(key = api_key)
+  
+  response <- tryCatch({
+    httr::POST(
+      url = api_endpoint_url,
+      httr::add_headers(.headers = c("Content-Type" = "application/json")),
+      query = query_params,
+      body = RJSONIO::toJSON(request_body, auto_unbox = TRUE),
+      encode = "json"
+    )
+  }, error = function(e) {
+    error_msg <- paste("Google Gemini API call failed:", e$message)
+    stop(error_msg, call. = FALSE)
+  })
+  
+  if (httr::http_error(response)) {
+    response_text <- httr::content(response, "text")
+    stop(paste0("Google Gemini API request failed with status ", httr::status_code(response), 
+                ". Response: ", response_text), call. = FALSE)
+  }
+  
+  response_content <- httr::content(response, "parsed")
+  
+  llm_raw_response_text <- "Error: Could not parse LLM response."
+  
+  if (!is.null(response_content$candidates) && length(response_content$candidates) > 0) {
+    if (!is.null(response_content$candidates[[1]]$content) && !is.null(response_content$candidates[[1]]$content$parts)) {
+      part_texts <- sapply(response_content$candidates[[1]]$content$parts, function(part) {
+        if (!is.null(part$text)) {
+          return(part$text)
+        } else {
+          return(NULL)
+        }
+      })
+      llm_raw_response_text <- paste(na.omit(part_texts), collapse = "\n")
+      
+      if (nchar(llm_raw_response_text) == 0) {
+        llm_raw_response_text <- "Error: LLM response was received but contained no extractable text."
+      }
+      
+    } else {
+      llm_raw_response_text <- "Error: LLM response candidates found, but content or parts are missing."
+    }
+  } else {
+    llm_raw_response_text <- "Error: No valid candidates found in LLM response. Check API key, model name, or prompt structure."
+    cat("Full response content:\n")
+    print(response_content)
+  }
+  
+  # --- 5. Parse LLM Output (using regex to find sections) ---
+  # We now rely on the LLM providing the specific markdown headers correctly.
+  message("4. Parsing LLM markdown response...")
+  
+  structured_recommendations <- list(
+    filtering = "Error: Feature Filtering recommendations could not be extracted.",
+    normalization = "Error: Normalization Method recommendations could not be extracted.",
+    overall_summary = "Error: Overall Summary could not be extracted."
+  )
+  
+  # Extract content based on markdown headers. Use DOTALL (?s) for multiline matching.
+  
+  # Capture Feature Filtering
+  filtering_pattern <- "(?s)### Feature Filtering\\n\\n(.*?)(?:\\n\\n### Normalization Method|\\n\\n### Overall Summary|$)"
+  filtering_match <- regmatches(llm_raw_response_text, regexec(filtering_pattern, llm_raw_response_text, perl = TRUE, ignore.case = TRUE))
+  if (length(filtering_match) > 0 && length(filtering_match[[1]]) > 1) {
+    structured_recommendations$filtering <- trimws(filtering_match[[1]][2])
+  } else {
+    # Fallback if the pattern doesn't match exactly, try to grab content after the start phrase until next expected header
+    fallback_filtering_pattern <- "(?s)Based on the provided.*?recommendations:(.*?)### Normalization Method"
+    fallback_filtering_match <- regmatches(llm_raw_response_text, regexec(fallback_filtering_pattern, llm_raw_response_text, perl = TRUE, ignore.case = TRUE))
+    if (length(fallback_filtering_match) > 0 && length(fallback_filtering_match[[1]]) > 1) {
+      structured_recommendations$filtering <- trimws(fallback_filtering_match[[1]][2])
+    }
+  }
+  
+  # Capture Normalization Method
+  normalization_pattern <- "(?s)### Normalization Method\\n\\n(.*?)(?:\\n\\n### Overall Summary|$)"
+  normalization_match <- regmatches(llm_raw_response_text, regexec(normalization_pattern, llm_raw_response_text, perl = TRUE, ignore.case = TRUE))
+  if (length(normalization_match) > 0 && length(normalization_match[[1]]) > 1) {
+    structured_recommendations$normalization <- trimws(normalization_match[[1]][2])
+  } else {
+    # Fallback if only normalization section exists or if overall summary is absent
+    fallback_normalization_pattern <- "(?s)### Normalization Method\\n\\n(.*?)(?:### Overall Summary|$)"
+    fallback_normalization_match <- regmatches(llm_raw_response_text, regexec(fallback_normalization_pattern, llm_raw_response_text, perl = TRUE, ignore.case = TRUE))
+    if (length(fallback_normalization_match) > 0 && length(fallback_normalization_match[[1]]) > 1) {
+      structured_recommendations$normalization <- trimws(fallback_normalization_match[[1]][2])
+    }
+  }
+  
+  # Capture Overall Summary (can be at the end, or if previous sections failed)
+  overall_summary_pattern <- "(?s)### Overall Summary\\n\\n(.*?)(?:$)"
+  overall_summary_match <- regmatches(llm_raw_response_text, regexec(overall_summary_pattern, llm_raw_response_text, perl = TRUE, ignore.case = TRUE))
+  if (length(overall_summary_match) > 0 && length(overall_summary_match[[1]]) > 1) {
+    structured_recommendations$overall_summary <- trimws(overall_summary_match[[1]][2])
+  } else {
+    # If 'Overall Summary' header is missing, or if there were previous errors, try to make a summary.
+    if (grepl("Error:", llm_raw_response_text, fixed = TRUE)) {
+      structured_recommendations$overall_summary <- paste("LLM Error during processing or formatting:", llm_raw_response_text)
+    } else if (!grepl("Error:", structured_recommendations$filtering) && !grepl("Error:", structured_recommendations$normalization)) {
+      structured_recommendations$overall_summary <- "Preprocessing recommendations provided. Please review filtering and normalization sections."
+    } else {
+      # If there are errors but they weren't captured by the specific section errors
+      structured_recommendations$overall_summary <- paste("Could not fully parse recommendations. Raw output snippet:\n", substr(llm_raw_response_text, 1, 500))
+    }
+  }
+  
+  # --- 6. Print Structured Output to Terminal ---
+  message("4. Displaying structured recommendations...")
+  cat("\n--- MicroAssist Preprocessing Analysis Report ---\n")
+  cat("Timestamp: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  
+  cat("--- Experimental Context ---\n")
+  cat(experimental_context)
+  cat("\n\n")
+  
+  cat("--- Dataset Characteristics ---\n")
+  cat("  Dimensions: ", microbiome_metrics$dataset_dimensions$num_samples, " samples, ", microbiome_metrics$dataset_dimensions$num_features, " features\n")
+  cat("  Sparsity: ", round(microbiome_metrics$dataset_sparsity, 4), "\n")
+  cat("  Sample Total Counts (5%-95%): ", format_quantiles(microbiome_metrics$sample_level_metrics$total_counts$quantiles), "\n")
+  cat("  Sample Feature Richness (5%-95%): ", format_quantiles(microbiome_metrics$sample_level_metrics$feature_richness$quantiles), "\n")
+  cat("  Feature Detection Prevalence (5%-95%): ", format_quantiles(microbiome_metrics$feature_prevalence$quantiles), "\n\n")
+  
+  cat("--- Preprocessing Recommendations ---\n\n")
+  
+  cat("### Feature Filtering\n")
+  cat(structured_recommendations$filtering)
+  cat("\n\n")
+  
+  cat("### Normalization Method\n")
+  cat(structured_recommendations$normalization)
+  cat("\n\n")
+  
+  cat("### Overall Summary\n")
+  cat(structured_recommendations$overall_summary)
+  cat("\n")
+  
+  # --- 7. Save Output to Text File ---
+  message("5. Saving output to text file...")
+  timestamp_str <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  output_filename <- paste0("microassist_preprocessing_recommendations_", timestamp_str, ".txt")
+  
+  full_output_for_file <- paste(
+    "--- MicroAssist Preprocessing Analysis Report ---",
+    "\nTimestamp: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    "\n\n",
+    "--- Experimental Context ---\n", experimental_context, "\n\n",
+    "--- Dataset Characteristics ---\n",
+    "  Dimensions: ", microbiome_metrics$dataset_dimensions$num_samples, " samples, ", microbiome_metrics$dataset_dimensions$num_features, " features\n",
+    "  Sparsity: ", round(microbiome_metrics$dataset_sparsity, 4), "\n",
+    "  Sample Total Counts (5%-95%): ", format_quantiles(microbiome_metrics$sample_level_metrics$total_counts$quantiles), "\n",
+    "  Sample Feature Richness (5%-95%): ", format_quantiles(microbiome_metrics$sample_level_metrics$feature_richness$quantiles), "\n",
+    "  Feature Detection Prevalence (5%-95%): ", format_quantiles(microbiome_metrics$feature_prevalence$quantiles), "\n\n",
+    "--- Preprocessing Recommendations ---\n\n",
+    "### Feature Filtering\n\n", structured_recommendations$filtering, "\n\n",
+    "### Normalization Method\n\n", structured_recommendations$normalization, "\n\n",
+    "### Overall Summary\n\n", structured_recommendations$overall_summary, "\n"
+  )
+  
+  tryCatch({
+    writeLines(full_output_for_file, output_filename)
+    message("Full preprocessing recommendations saved to: ", output_filename)
+  }, error = function(e) {
+    warning("Failed to save output to file '", output_filename, "': ", e$message)
+  })
+  
+  # --- 5. Return Results ---
+  return(list(
+    recommendations = structured_recommendations, # This is now a list with parsed sections
+    generated_metrics = microbiome_metrics,
+    experimental_context_summary = experimental_context
+  ))
+}
+
+
+library(phyloseq)
+data("Hartwig")   # built-in example dataset in phyloseq
+ps_example <- Hartwig
+
+my_context <- "Comparing microbiome composition across sample types in Hartwig dataset; exploratory diversity and compositional differences."
+experimental_context <- my_context
+result <- microbeassist_preprocessor(ps_example, experimental_context = my_context)
+
+#check the variables of the dataset
+sample_variables(ps_example)
+
+```
