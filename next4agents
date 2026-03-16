@@ -460,6 +460,7 @@ microassist_taxonomic_insights_gemini <- function(ps,
                                                    experimental_context,
                                                    rank = "Phylum",
                                                    top_n = 15,
+                                                    group_var = NULL,
                                                    google_api_key = NULL,
                                                    api_key_file = "/Users/data/api_keys.txt",
                                                    model_name = "gemini-1.5-flash-latest",
@@ -472,6 +473,9 @@ microassist_taxonomic_insights_gemini <- function(ps,
   if (!(rank %in% available_ranks)) {
     stop("Requested rank '", rank, "' is not available. Available ranks: ", paste(available_ranks, collapse = ", "))
   }
+
+  sample_df <- as.data.frame(sample_data(ps))
+  selected_group_var <- microassist_choose_group_var(sample_df, requested_group_var = group_var)
 
   ps_rel <- microbiome::transform(ps, "compositional")
   ps_rank <- phyloseq::tax_glom(ps_rel, taxrank = rank, NArm = FALSE)
@@ -491,32 +495,57 @@ microassist_taxonomic_insights_gemini <- function(ps,
     stringsAsFactors = FALSE
   )
 
+  group_summary <- "No valid grouping variable available for group-level taxonomic analysis."
+  if (!is.null(selected_group_var) && selected_group_var %in% colnames(sample_df)) {
+    aligned_group <- as.character(sample_df[rownames(otu_rank), selected_group_var, drop = TRUE])
+    group_levels <- unique(aligned_group[!is.na(aligned_group) & aligned_group != ""])
+    group_tables <- lapply(group_levels, function(gl) {
+      idx <- aligned_group == gl
+      grp_mean <- rowMeans(otu_rank[, idx, drop = FALSE], na.rm = TRUE)
+      grp_top <- sort(grp_mean, decreasing = TRUE)[1:min(top_n, length(grp_mean))]
+      ids <- names(grp_top)
+      labels <- taxa_df[ids, rank, drop = TRUE]
+      data.frame(
+        group = gl,
+        taxon_id = ids,
+        label = as.character(labels),
+        mean_relative_abundance = as.numeric(grp_top),
+        stringsAsFactors = FALSE
+      )
+    })
+    group_table <- do.call(rbind, group_tables)
+    colnames(group_table)[colnames(group_table) == "group"] <- selected_group_var
+    group_summary <- paste(capture.output(print(utils::head(group_table, 30))), collapse = "\n")
+  }
+
   prompt <- paste0(
     "You are an expert in microbiome taxonomic interpretation. Return markdown only with sections:\n",
     "### Dominant Taxa and Biological Roles\n\n",
-    "### Deviations from Expected Composition\n\n",
+    "### Group-Level Taxonomic Differences\n\n",
     "### Priority Taxa for Investigation\n\n",
     "Context: ", experimental_context, "\n",
     "Taxonomic rank analyzed: ", rank, "\n\n",
-    "Top taxa table:\n", paste(capture.output(print(top_table)), collapse = "\n")
+    "Top taxa table:\n", paste(capture.output(print(top_table)), collapse = "\n"), "\n\n",
+    "Grouping variable used: ", ifelse(is.null(selected_group_var), "None", selected_group_var), "\n",
+    "Group-level top taxa preview:\n", group_summary
   )
 
   llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
   sections <- microassist_extract_sections(
     llm_text,
-    c("Dominant Taxa and Biological Roles", "Deviations from Expected Composition", "Priority Taxa for Investigation")
+    c("Dominant Taxa and Biological Roles", "Group-Level Taxonomic Differences", "Priority Taxa for Investigation")
   )
 
   body <- paste0(
     "--- Taxonomic Composition Insights ---\n\n",
     "### Dominant Taxa and Biological Roles\n", sections[["Dominant Taxa and Biological Roles"]], "\n\n",
-    "### Deviations from Expected Composition\n", sections[["Deviations from Expected Composition"]], "\n\n",
+    "### Group-Level Taxonomic Differences\n", sections[["Group-Level Taxonomic Differences"]], "\n\n",
     "### Priority Taxa for Investigation\n", sections[["Priority Taxa for Investigation"]]
   )
 
   report_file <- microassist_save_report("microassist_taxonomic_composition_insights", experimental_context, body)
 
-  list(insights = sections, top_taxa_table = top_table, report_file = report_file)
+   list(insights = sections, top_taxa_table = top_table, grouping_variable = selected_group_var, report_file = report_file)
 }
 
 # --- Agent 5: Integrated Analysis Report ---
