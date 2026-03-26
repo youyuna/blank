@@ -183,22 +183,45 @@ microassist_call_gemini_with_retry <- function(final_prompt_text,
 }
 
 microassist_extract_markdown_sections <- function(text, headers) {
-  out <- list()
-  for (i in seq_along(headers)) {
-    h <- headers[[i]]
-    h_next <- if (i < length(headers)) headers[[i + 1]] else NULL
+  normalize_header <- function(x) {
+    x <- tolower(trimws(x))
+    x <- gsub("^#+\\s*", "", x)
+    x <- gsub("[:\\-]+\\s*$", "", x)
+    x <- gsub("[^a-z0-9]+", " ", x)
+    trimws(x)
+  }
 
-    pattern <- if (is.null(h_next)) {
-      paste0("(?s)### ", h, "\\n\\n(.*)$")
-    } else {
-      paste0("(?s)### ", h, "\\n\\n(.*?)(?:\\n\\n### ", h_next, "|$)")
+    lines <- unlist(strsplit(text, "\n", fixed = TRUE))
+  heading_idx <- grep("^\\s*###\\s+", lines)
+
+  parsed <- list()
+  if (length(heading_idx) > 0) {
+    for (k in seq_along(heading_idx)) {
+      start <- heading_idx[[k]]
+      end <- if (k < length(heading_idx)) heading_idx[[k + 1]] - 1 else length(lines)
+      raw_heading <- sub("^\\s*###\\s+", "", lines[[start]])
+      key <- normalize_header(raw_heading)
+      body <- if (start + 1 <= end) paste(lines[(start + 1):end], collapse = "\n") else ""
+      body <- trimws(body)
+      if (!(key %in% names(parsed)) || nchar(parsed[[key]]) == 0) {
+        parsed[[key]] <- body
+      }
     }
+  }
 
-    m <- regmatches(text, regexec(pattern, text, perl = TRUE, ignore.case = TRUE))
-    if (length(m) > 0 && length(m[[1]]) > 1) {
-      out[[h]] <- trimws(m[[1]][2])
+    out <- list()
+  for (h in headers) {
+    key <- normalize_header(h)
+    if (!is.null(parsed[[key]]) && nchar(parsed[[key]]) > 0) {
+      out[[h]] <- parsed[[key]]
     } else {
-      out[[h]] <- paste0("Error: Could not parse section '", h, "'.")
+      # fallback: partial key matching when model slightly rewrites headings
+      matches <- names(parsed)[startsWith(names(parsed), key) | startsWith(key, names(parsed))]
+      if (length(matches) > 0 && nchar(parsed[[matches[[1]]]]) > 0) {
+        out[[h]] <- parsed[[matches[[1]]]]
+      } else {
+        out[[h]] <- paste0("Error: Could not parse section '", h, "'.")
+      }
     }
   }
   out
@@ -223,10 +246,55 @@ microassist_write_report <- function(prefix, context, sections) {
   filename
 }
 
+microassist_safe_filename <- function(x) {
+  out <- gsub("[^A-Za-z0-9._-]+", "_", x)
+  out <- gsub("_+", "_", out)
+  out <- gsub("^_|_$", "", out)
+  ifelse(nchar(out) == 0, "untitled", out)
+}
+
+microassist_write_intermediate_results <- function(prefix,
+                                                   named_objects,
+                                                   output_dir = ".") {
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  out_files <- c()
+
+  for (nm in names(named_objects)) {
+    obj <- named_objects[[nm]]
+    safe_nm <- microassist_safe_filename(nm)
+    base <- file.path(output_dir, paste0(prefix, "_", safe_nm, "_", stamp))
+
+    if (is.data.frame(obj)) {
+      fp <- paste0(base, ".tsv")
+      utils::write.table(obj, file = fp, sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+      out_files <- c(out_files, fp)
+    } else if (inherits(obj, "dist")) {
+      fp <- paste0(base, ".tsv")
+      dm <- as.matrix(obj)
+      utils::write.table(dm, file = fp, sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+      out_files <- c(out_files, fp)
+    } else {
+      fp <- paste0(base, ".txt")
+      txt <- if (is.character(obj) && length(obj) == 1) {
+        obj
+      } else {
+        paste(capture.output(str(obj, max.level = 3)), collapse = "\n")
+      }
+      writeLines(txt, fp)
+      out_files <- c(out_files, fp)
+    }
+  }
+
+  message("Saved intermediate files: ", paste(out_files, collapse = ", "))
+  out_files
+}
+
 microassist_write_html_report <- function(prefix,
                                           context,
                                           sections,
-                                          figure_paths = character(0)) {
+                                          figure_paths = character(0),
+                                          report_title = "Integrated Microbiome Analysis Report") {
   timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
   filename <- paste0(prefix, "_", timestamp, ".html")
 
@@ -239,10 +307,26 @@ microassist_write_html_report <- function(prefix,
 
   section_html <- paste(vapply(names(sections), function(h) {
     body <- esc(sections[[h]])
-    body <- gsub("\n", "<br/>", body)
-    paste0("<section><h3>", esc(h), "</h3><p>", body, "</p></section>")
+    anchor <- microassist_safe_filename(tolower(h))
+    if (tolower(h) == "sessioninfo()") {
+      paste0("<section id=\"", anchor, "\"><h3>", esc(h), "</h3><pre><code>", body, "</code></pre></section>")
+    } else {
+      body <- gsub("\n", "<br/>", body)
+      paste0("<section id=\"", anchor, "\"><h3>", esc(h), "</h3><p>", body, "</p></section>")
+    }
   }, character(1)), collapse = "\n")
 
+  toc_items <- paste(vapply(names(sections), function(h) {
+    anchor <- microassist_safe_filename(tolower(h))
+    paste0("<li><a href=\"#", anchor, "\">", esc(h), "</a></li>")
+  }, character(1)), collapse = "")
+  toc_html <- paste0(
+    "<details open><summary><strong>Table of Contents</strong></summary>",
+    "<ul>", toc_items, if (length(figure_paths) > 0) "<li><a href=\"#figures\">Figures</a></li>" else "",
+    "</ul></details>"
+  )
+
+  
   figure_html <- ""
   if (length(figure_paths) > 0) {
     figure_blocks <- vapply(seq_along(figure_paths), function(i) {
@@ -253,16 +337,17 @@ microassist_write_html_report <- function(prefix,
         i, "</figcaption></figure>"
       )
     }, character(1))
-    figure_html <- paste0("<h2>Figures</h2>\n", paste(figure_blocks, collapse = "\n"))
+    figure_html <- paste0("<h2 id=\"figures\">Figures</h2>\n", paste(figure_blocks, collapse = "\n"))
   }
 
   html <- paste0(
     "<!doctype html><html><head><meta charset=\"utf-8\"/>",
-    "<title>Integrated Microbiome Analysis Report</title>",
-    "<style>body{font-family:Arial,sans-serif;max-width:1000px;margin:40px auto;line-height:1.5;padding:0 16px;}h1,h2,h3{color:#1f2937;}section{margin-bottom:24px;}figure{margin:20px 0;}figcaption{color:#4b5563;font-size:0.9em;}code{background:#f3f4f6;padding:2px 4px;border-radius:4px;}</style>",
+    "<title>", esc(report_title), "</title>",
+    "<style>body{font-family:Arial,sans-serif;max-width:1000px;margin:40px auto;line-height:1.5;padding:0 16px;}h1,h2,h3{color:#1f2937;}section{margin-bottom:24px;}figure{margin:20px 0;}figcaption{color:#4b5563;font-size:0.9em;}code{background:#f3f4f6;padding:2px 4px;border-radius:4px;}details{background:#f9fafb;padding:12px;border:1px solid #e5e7eb;border-radius:8px;margin:18px 0;}pre{background:#111827;color:#f9fafb;padding:12px;border-radius:8px;overflow:auto;}</style>",
     "</head><body>",
-    "<h1>Integrated Microbiome Analysis Report</h1>",
+    "<h1>", esc(report_title), "</h1>",
     "<p><strong>Timestamp:</strong> ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "</p>",
+    toc_html,
     "<h2>Experimental Context</h2><p>", esc(context), "</p>",
     section_html,
     figure_html,
@@ -461,6 +546,102 @@ microassist_generate_integrated_figures <- function(alpha_result,
   }, silent = TRUE)
 
   out
+}
+
+microassist_build_taxa_interaction_network <- function(ps,
+                                                       rank = "Genus",
+                                                       top_n = 25,
+                                                       min_abs_cor = 0.4,
+                                                       p_adjust_cutoff = 0.1,
+                                                       output_dir = ".",
+                                                       prefix = "microassist_integrated") {
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+  chosen_rank <- rank
+  if (!(chosen_rank %in% phyloseq::rank_names(ps))) {
+    chosen_rank <- phyloseq::rank_names(ps)[1]
+  }
+
+  ps_rel <- microbiome::transform(ps, "compositional")
+  ps_rank <- phyloseq::tax_glom(ps_rel, taxrank = chosen_rank, NArm = FALSE)
+  otu_rank <- as(phyloseq::otu_table(ps_rank), "matrix")
+  if (!phyloseq::taxa_are_rows(ps_rank)) otu_rank <- t(otu_rank)
+
+  if (nrow(otu_rank) < 3 || ncol(otu_rank) < 4) {
+    return(list(edge_table = data.frame(), node_table = data.frame(), figure_file = NULL, rank = chosen_rank))
+  }
+
+  taxa_df <- as.data.frame(phyloseq::tax_table(ps_rank))
+  mean_abundance <- rowMeans(otu_rank, na.rm = TRUE)
+  keep_ids <- names(sort(mean_abundance, decreasing = TRUE))[1:min(top_n, length(mean_abundance))]
+  mat <- otu_rank[keep_ids, , drop = FALSE]
+
+  cm <- suppressWarnings(stats::cor(t(mat), method = "spearman", use = "pairwise.complete.obs"))
+  n <- ncol(mat)
+  if (!is.finite(n) || n < 4) {
+    return(list(edge_table = data.frame(), node_table = data.frame(), figure_file = NULL, rank = chosen_rank))
+  }
+  tval <- abs(cm) * sqrt((n - 2) / pmax(1e-12, (1 - cm^2)))
+  pm <- 2 * stats::pt(-abs(tval), df = n - 2)
+  pm[lower.tri(pm, diag = TRUE)] <- NA_real_
+
+  idx <- which(!is.na(pm), arr.ind = TRUE)
+  if (nrow(idx) == 0) {
+    return(list(edge_table = data.frame(), node_table = data.frame(), figure_file = NULL, rank = chosen_rank))
+  }
+  pvals <- pm[idx]
+  padj <- stats::p.adjust(pvals, method = "BH")
+  cors <- cm[idx]
+
+  edge_table <- data.frame(
+    taxon_1 = rownames(cm)[idx[, 1]],
+    taxon_2 = colnames(cm)[idx[, 2]],
+    spearman_rho = as.numeric(cors),
+    p_value = as.numeric(pvals),
+    p_adj = as.numeric(padj),
+    stringsAsFactors = FALSE
+  )
+  edge_table <- edge_table[abs(edge_table$spearman_rho) >= min_abs_cor & edge_table$p_adj <= p_adjust_cutoff, , drop = FALSE]
+
+  node_table <- data.frame(
+    taxon_id = keep_ids,
+    taxon_label = as.character(taxa_df[keep_ids, chosen_rank, drop = TRUE]),
+    mean_relative_abundance = as.numeric(mean_abundance[keep_ids]),
+    stringsAsFactors = FALSE
+  )
+
+  fig_file <- NULL
+  if (nrow(edge_table) > 0) {
+    nodes <- unique(c(edge_table$taxon_1, edge_table$taxon_2))
+    sub_cor <- cm[nodes, nodes, drop = FALSE]
+    dist_mat <- as.dist(1 - abs(sub_cor))
+    coords <- cmdscale(dist_mat, k = 2)
+    coord_df <- data.frame(taxon_id = rownames(coords), x = coords[, 1], y = coords[, 2], stringsAsFactors = FALSE)
+    coord_df <- merge(coord_df, node_table, by = "taxon_id", all.x = TRUE)
+    coord_df$taxon_label[is.na(coord_df$taxon_label) | coord_df$taxon_label == ""] <- coord_df$taxon_id[is.na(coord_df$taxon_label) | coord_df$taxon_label == ""]
+
+    edge_plot <- merge(edge_table, coord_df[, c("taxon_id", "x", "y")], by.x = "taxon_1", by.y = "taxon_id", all.x = TRUE)
+    edge_plot <- merge(edge_plot, coord_df[, c("taxon_id", "x", "y")], by.x = "taxon_2", by.y = "taxon_id", all.x = TRUE, suffixes = c("_1", "_2"))
+
+    p <- ggplot() +
+      geom_segment(data = edge_plot, aes(x = x_1, y = y_1, xend = x_2, yend = y_2, color = spearman_rho, size = abs(spearman_rho)), alpha = 0.6) +
+      geom_point(data = coord_df, aes(x = x, y = y, size = mean_relative_abundance), color = "#1f77b4") +
+      geom_text(data = coord_df, aes(x = x, y = y, label = taxon_label), vjust = -0.8, size = 3) +
+      scale_color_gradient2(low = "#2563eb", high = "#dc2626", mid = "#9ca3af", midpoint = 0) +
+      theme_bw() +
+      labs(
+        title = paste0("Taxa Interaction Network (Data-only, ", chosen_rank, ")"),
+        x = "Layout Axis 1",
+        y = "Layout Axis 2",
+        color = "Spearman rho",
+        size = "Magnitude"
+      )
+    fig_file <- file.path(output_dir, paste0(prefix, "_taxa_network_", stamp, ".png"))
+    ggsave(fig_file, p, width = 9, height = 7, dpi = 150)
+  }
+
+  list(edge_table = edge_table, node_table = node_table, figure_file = fig_file, rank = chosen_rank)
 }
 
 microassist_choose_group_var <- function(meta_df,
@@ -674,6 +855,15 @@ microassist_alpha_diversity_agent <- function(ps,
   )
 
   headers <- c("Alpha Diversity Interpretation", "Group-Level Biological Context", "Mechanistic Hypotheses")
+  llm_input_files <- microassist_write_intermediate_results(
+    prefix = "microassist_alpha_input",
+    named_objects = list(
+      experimental_context = experimental_context,
+      alpha_metric_note = alpha_input$note,
+      alpha_metrics = alpha_df,
+      group_summary = group_summary
+    )
+  )
   sections <- microassist_safe_llm_sections(
     prompt, headers, api_key, model_name, temperature, max_output_tokens,
     max_retries = llm_max_retries,
@@ -688,6 +878,7 @@ microassist_alpha_diversity_agent <- function(ps,
     alpha_metrics = alpha_df,
     alpha_metric_note = alpha_input$note,
     grouping_variable = selected_group_var,
+    llm_input_files = llm_input_files,
     report_file = report_file
   )
 }
@@ -766,6 +957,17 @@ microassist_beta_diversity_agent <- function(ps,
   )
 
   headers <- c("Community Similarity and Separation", "Likely Drivers (Taxa or Functions)", "Community-Structure Hypotheses")
+  llm_input_files <- microassist_write_intermediate_results(
+    prefix = "microassist_beta_input",
+    named_objects = list(
+      experimental_context = experimental_context,
+      group_line = group_line,
+      distance_stats = as.data.frame(t(round(dist_stats, 6))),
+      top_eigenvalues = data.frame(eigenvalue = as.numeric(eig_preview)),
+      top_variable_taxa = data.frame(taxon_id = names(top_taxa_small), variance = as.numeric(top_taxa_small), stringsAsFactors = FALSE),
+      distance_matrix = dist_obj
+    )
+  )
   sections <- microassist_safe_llm_sections(
     prompt, headers, api_key, model_name, temperature, max_output_tokens,
     max_retries = llm_max_retries,
@@ -782,6 +984,7 @@ microassist_beta_diversity_agent <- function(ps,
     ordination = ord,
     group_values = group_values,
     top_variable_taxa = top_taxa,
+    llm_input_files = llm_input_files,
     report_file = report_file
   )
 }
@@ -881,6 +1084,17 @@ microassist_taxonomic_composition_agent <- function(ps,
   )
 
   headers <- c("Dominant Taxa and Biological Roles", "Deviations from Expected Composition", "Group-Level Taxonomic Differences", "Priority Microbes for Follow-Up")
+  llm_input_files <- microassist_write_intermediate_results(
+    prefix = "microassist_taxonomic_input",
+    named_objects = list(
+      experimental_context = experimental_context,
+      rank = rank,
+      top_table = top_table,
+      grouping_variable = ifelse(is.null(selected_group_var), "None", selected_group_var),
+      group_top_table = group_top_table,
+      group_summary = group_summary
+    )
+  )
   sections <- microassist_safe_llm_sections(
     prompt, headers, api_key, model_name, temperature, max_output_tokens,
     max_retries = llm_max_retries,
@@ -892,9 +1106,12 @@ microassist_taxonomic_composition_agent <- function(ps,
   list(
     agent = "taxonomic_composition",
     sections = sections,
+    ps_input = ps,
+    rank_used = rank,
     grouping_variable = selected_group_var,
     top_table = top_table,
     group_top_table = group_top_table,
+    llm_input_files = llm_input_files,
     report_file = report_file
   )
 }
@@ -929,10 +1146,18 @@ microassist_integrated_report_agent <- function(experimental_context,
   prompt <- paste0(
     "You are generating a final microbiome analysis report for a biology team. ",
     "Return markdown ONLY with the exact headers:\n\n",
+    "### Report Title\n\n",
     "### Executive Summary\n\n",
     "### Cross-Analysis Synthesis\n\n",
+    "### Similar Systems in Literature\n\n",
+    "### Novel Findings\n\n",
+    "### Key Taxa in Experimental Context\n\n",
     "### Actionable Biological Hypotheses\n\n",
     "### Recommended Validation Experiments\n\n",
+    "Rules:\n",
+    "1) Propose a concise presentation-ready report title under 'Report Title'.\n",
+    "2) For literature sections, provide grounded narrative (no fabricated citations).\n",
+    "3) For key taxa section, use only taxa that appear in the provided analysis outputs.\n\n",
     "Context:\n", experimental_context, "\n\n",
     "Preprocessing output preview:\n", obj_preview(preprocessing_result), "\n\n",
     "Alpha output preview:\n", obj_preview(alpha_result), "\n\n",
@@ -940,7 +1165,27 @@ microassist_integrated_report_agent <- function(experimental_context,
     "Taxonomic output preview:\n", obj_preview(taxonomic_result), "\n"
   )
 
-  headers <- c("Executive Summary", "Cross-Analysis Synthesis", "Actionable Biological Hypotheses", "Recommended Validation Experiments")
+ headers <- c(
+    "Report Title",
+    "Executive Summary",
+    "Cross-Analysis Synthesis",
+    "Similar Systems in Literature",
+    "Novel Findings",
+    "Key Taxa in Experimental Context",
+    "Actionable Biological Hypotheses",
+    "Recommended Validation Experiments"
+  )
+  llm_input_files <- microassist_write_intermediate_results(
+    prefix = "microassist_integrator_input",
+    named_objects = list(
+      experimental_context = experimental_context,
+      preprocessing_preview = obj_preview(preprocessing_result),
+      alpha_preview = obj_preview(alpha_result),
+      beta_preview = obj_preview(beta_result),
+      taxonomic_preview = obj_preview(taxonomic_result)
+    )
+  )
+  
   sections <- microassist_safe_llm_sections(
     prompt, headers, api_key, model_name, temperature, max_output_tokens,
     max_retries = llm_max_retries,
@@ -955,7 +1200,9 @@ microassist_integrated_report_agent <- function(experimental_context,
     taxonomic_result = taxonomic_result,
     preprocessing_report_file = preprocessing_report_file
   )
-  combined_sections <- c(sections, previous_report_sections)
+  
+  session_info_text <- paste(capture.output(sessionInfo()), collapse = "\n")
+  combined_sections <- c(sections, previous_report_sections, list("sessionInfo()" = session_info_text))
 
   report_file_txt <- microassist_write_report("microassist_integrated_analysis_report", experimental_context, combined_sections)
 
@@ -967,17 +1214,46 @@ microassist_integrated_report_agent <- function(experimental_context,
     prefix = "microassist_integrated"
   )
 
+  network <- microassist_build_taxa_interaction_network(
+    ps = taxonomic_result$ps_input,
+    rank = taxonomic_result$rank_used,
+    output_dir = figure_output_dir,
+    prefix = "microassist_integrated"
+  )
+  if (!is.null(network$figure_file) && file.exists(network$figure_file)) {
+    figure_paths <- c(figure_paths, network$figure_file)
+  }
+
+  network_files <- microassist_write_intermediate_results(
+    prefix = "microassist_network",
+    named_objects = list(
+      network_rank = network$rank,
+      node_table = network$node_table,
+      edge_table = network$edge_table
+    ),
+    output_dir = figure_output_dir
+  )
+
+  report_title <- trimws(sections[["Report Title"]])
+  if (is.null(report_title) || nchar(report_title) == 0 || grepl("^LLM call failed", report_title)) {
+    report_title <- "Integrated Microbiome Analysis Report"
+  }
+
   report_file_html <- microassist_write_html_report(
     prefix = "microassist_integrated_analysis_report",
     context = experimental_context,
     sections = combined_sections,
-    figure_paths = figure_paths
+    figure_paths = figure_paths,
+    report_title = report_title
   )
 
   list(
     agent = "integrated_report",
     sections = sections,
     embedded_agent_reports = previous_report_sections,
+    llm_input_files = llm_input_files,
+    network = network,
+    network_files = network_files,
     report_file = report_file_txt,
     report_file_html = report_file_html,
     figure_files = figure_paths
