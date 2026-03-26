@@ -25,7 +25,7 @@ if (!exists("out")) {
 available_ranks <- phyloseq::rank_names(ps_example)
 preferred_rank <- if ("Phylum" %in% available_ranks) "Phylum" else if ("phylum" %in% available_ranks) "phylum" else available_ranks[[1]]
 
-tax_df <- as.data.frame(phyloseq::tax_table(ps_example))
+
 normalize_taxon <- function(x) {
   x <- trimws(as.character(x))
   x <- gsub("^['\"`]|['\"`]$", "", x)
@@ -44,12 +44,8 @@ original_microbe_list_from_phyloseq_raw <- original_microbe_list_from_phyloseq_r
 reference_list <- sort(unique(normalize_taxon(original_microbe_list_from_phyloseq_raw)))
 reference_list <- reference_list[reference_list != ""]
 
-# Gather all integrated-report text blocks and detect mentioned microbes by exact string match
-integrated_sections <- unlist(out$integrated_result$sections, use.names = FALSE)
-embedded_sections <- unlist(out$integrated_result$embedded_agent_reports, use.names = FALSE)
-all_integrated_text <- paste(c(integrated_sections, embedded_sections), collapse = "\n\n")
-
-# Extract phylum-like tokens from report text (not limited to the reference list)
+# Build integrated-result taxa list from structured outputs first (preferred),
+# with report-text extraction as a fallback.
 extract_report_phyla <- function(text_blob) {
   # Candidate words with phylum-like suffixes in microbiome reports
   rx <- "\\b([A-Za-z][A-Za-z0-9_-]{2,}(?:bacteria|ota|mycota|archaeota))\\b"
@@ -64,11 +60,26 @@ extract_report_phyla <- function(text_blob) {
   sort(unique(normalize_taxon(c(raw, raw_pref))))
 }
 
-report_phyla_all <- extract_report_phyla(all_integrated_text)
+# Gather all integrated-report text blocks and detect mentioned microbes by exact string match
+integrated_taxa_from_tables <- character(0)
+if (!is.null(out$tax_result) && !is.null(out$tax_result$top_table) && nrow(out$tax_result$top_table) > 0) {
+  # Prefer human-readable labels first, fallback to IDs
+  tt <- out$tax_result$top_table
+  taxa_candidates <- c(as.character(tt$taxon_label), as.character(tt$taxon_id))
+  integrated_taxa_from_tables <- normalize_taxon(taxa_candidates)
+  integrated_taxa_from_tables <- integrated_taxa_from_tables[integrated_taxa_from_tables != "" & integrated_taxa_from_tables != "na"]
+}
 
-# Keep a reference-constrained list too, for direct overlap accounting
-integrated_report_microbe_list <- sort(unique(intersect(report_phyla_all, reference_list)))
-integrated_report_microbe_list_all_mentions <- report_phyla_all
+if (length(integrated_taxa_from_tables) > 0) {
+  integrated_report_microbe_list <- sort(unique(integrated_taxa_from_tables))
+  integrated_source <- "out$tax_result$top_table (structured taxa output)"
+} else {
+  integrated_sections <- unlist(out$integrated_result$sections, use.names = FALSE)
+  all_integrated_text <- paste(integrated_sections, collapse = "\n\n")
+  report_phyla_all <- extract_report_phyla(all_integrated_text)
+  integrated_report_microbe_list <- sort(unique(report_phyla_all))
+  integrated_source <- "out$integrated_result$sections (text-extracted taxa fallback)"
+}
 
 # Keep two explicit objects requested by user
 reference_name <- "original_microbe_list_from_phyloseq"
@@ -80,7 +91,7 @@ if (length(integrated_report_microbe_list_all_mentions) > 0) {
 print(paste("Selected taxonomic rank for original list:", preferred_rank))
 print(paste("Original microbe list size:", length(reference_list)))
 print(paste("Integrated report microbe list size:", length(integrated_report_microbe_list)))
-print(paste("Integrated report phylum mentions (all) size:", length(integrated_report_microbe_list_all_mentions)))
+print(paste("Integrated taxa source:", integrated_source))
 
 
 # Function to calculate overlap, unique taxa, groundedness score, and unique taxa list
