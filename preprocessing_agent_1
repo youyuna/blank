@@ -7,6 +7,7 @@ library(httr)
 library(RJSONIO) # Used for toJSON
 library(stats)   # For quantile, summary
 library(dplyr)   # For data manipulation
+library(tidyverse)
 
 
 # --- Main Function Dispatcher ---
@@ -448,14 +449,67 @@ microassist_preprocessor_gemini <- function(ps,
 
 
 library(phyloseq)
-data("Hartwig")   # built-in example dataset in phyloseq
-ps_example <- Hartwig
+# library(MicrobeDS)
+# data("Hartwig")
+# ps_example <- Hartwig
 
-my_context <- "Comparing microbiome composition across sample types in Hartwig dataset; exploratory diversity and compositional differences."
+#recreating phyloseq object from a paper
+# Lets make a gigantic metadata file joining by DNI
+meta1 <- read.csv("~/Downloads/metadata_124.csv", check.names = FALSE)
+
+# metadata file 2
+meta2 <- read.delim("~/Downloads/metadata_all_PACS.tsv", check.names = FALSE) |>
+  dplyr::select(sample, Time, COVID19, COVID19_severity, BMI, DNI, 
+                Treatment, Age, Old, Sex, Antibiotic, remove_duplicate) |>
+  dplyr::mutate_all(~replace(., is.na(.), 0))
+
+# Filter and make it easier for english speakers
+meta <- left_join(meta2, meta1, by = "DNI") |>
+  dplyr::filter(COVID19 == "COVID" & Time == "T0")|>
+  dplyr::mutate_all(~replace(., is.na(.), 0)) |>
+  dplyr::filter(ID > 0) |>
+  dplyr::filter(remove_duplicate == "") |>
+  dplyr::mutate_all(~ifelse(. == "no", 0, .)) |>
+  dplyr::mutate_all(~ifelse(. == "si", 1, .)) |>
+  tibble::column_to_rownames("sample")
+
+# Load and prepare taxonomy file
+tax_file <- read.delim("~/Downloads/emu-combined-taxonomy-species.tsv") |>
+  dplyr::select(superkingdom, phylum, class, order, family, genus, species) |>
+  as.matrix()
+
+# Ensure all elements in tax_file are characters
+tax_file <- apply(tax_file, 2, as.character)
+
+# Load in Emu results
+emu <- read.delim(file = "~/Downloads/emu-combined-abundance-species-counts.tsv", check.names = FALSE) |>
+  mutate_all(~replace(., is.na(.), 0)) |>
+  column_to_rownames("species")
+
+# Filter out columns ending with "-threshold-0.0001"
+filt_cols <- grep("-threshold-0.0001$", names(emu), value = TRUE, ignore.case = TRUE)
+filt_emu <- emu[, !(names(emu) %in% filt_cols)]
+
+# Convert to matrix and ensure numeric type for otu_table
+emu_otu_mat <- as.matrix(filt_emu)
+emu_otu_mat <- apply(emu_otu_mat, 2, as.numeric)
+
+# Create the OTU, sample data, and taxonomy table objects
+emu_otu <- otu_table(emu_otu_mat, taxa_are_rows = TRUE)
+emu_sam <- sample_data(meta)
+emu_tax <- tax_table(as.matrix(tax_file))
+
+# Combine into a phyloseq object
+physeq <- phyloseq(emu_otu, emu_sam, emu_tax)
+
+
+ps_example <- physeq
+my_context <- "Comparing microbiome composition in a research study focused on observing the links between the Covid-19 and the gut microbiome based on disease severity; exploratory diversity and compositional differences."
 experimental_context <- my_context
 result <- microbeassist_preprocessor(ps_example, experimental_context = my_context)
 
 #check the variables of the dataset
 sample_variables(ps_example)
+
 
 ```
