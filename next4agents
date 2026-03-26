@@ -133,7 +133,7 @@ microassist_save_report <- function(prefix, context, body_text) {
 
 microassist_choose_group_var <- function(meta_df,
                                          requested_group_var = NULL,
-                                         priority_candidates = c("primaryTumorType", "SampleType", "sample_type", "group", "Group", "condition", "Condition", "Treatment", "treatment"),
+                                         priority_candidates = c("COVID19_severity", "primaryTumorType", "SampleType", "sample_type", "group", "Group", "condition", "Condition", "Treatment", "treatment"),
                                          min_non_missing = 3,
                                          min_levels = 2,
                                          max_levels = 20) {
@@ -166,6 +166,93 @@ microassist_choose_group_var <- function(meta_df,
 
   NULL
 }
+
+microassist_prepare_alpha_input <- function(ps,
+                                            integer_tolerance = 1e-8,
+                                            round_tolerance = 1e-6) {
+  otu_counts <- as(phyloseq::otu_table(ps), "matrix")
+  taxa_rows <- phyloseq::taxa_are_rows(ps)
+  if (!taxa_rows) {
+    otu_counts <- t(otu_counts)
+  }
+
+  if (any(!is.finite(otu_counts))) {
+    stop("OTU table contains non-finite values (NA/NaN/Inf), which are not valid for alpha diversity.")
+  }
+  if (any(otu_counts < 0)) {
+    stop("OTU table contains negative abundances, which are not valid for alpha diversity.")
+  }
+
+  max_delta <- max(abs(otu_counts - round(otu_counts)))
+  can_round_to_counts <- is.finite(max_delta) && max_delta <= round_tolerance
+  is_integer_counts <- is.finite(max_delta) && max_delta <= integer_tolerance
+
+  alpha_measures <- c("Observed", "Shannon", "Simpson")
+  note <- "Using integer count data for alpha diversity."
+
+  ps_for_alpha <- ps
+  if (can_round_to_counts) {
+    rounded <- round(otu_counts)
+    otu_slot <- if (taxa_rows) rounded else t(rounded)
+    phyloseq::otu_table(ps_for_alpha) <- phyloseq::otu_table(otu_slot, taxa_are_rows = taxa_rows)
+    alpha_measures <- c(alpha_measures, "Chao1", "ACE")
+    if (!is_integer_counts) {
+      note <- paste0(
+        "Counts were near-integers and were rounded (max abs delta=",
+        signif(max_delta, 4),
+        ") so Chao1/ACE could be computed."
+      )
+    }
+  } else {
+    note <- paste0(
+      "Detected non-integer abundances (max abs delta=",
+      signif(max_delta, 4),
+      "). Chao1/ACE were skipped because they require integer counts."
+    )
+    warning(note, call. = FALSE)
+  }
+
+  list(
+    ps = ps_for_alpha,
+    measures = alpha_measures,
+    note = note,
+    use_basic_only = !can_round_to_counts,
+    otu_counts_taxa_rows = otu_counts
+  )
+}
+
+microassist_compute_basic_alpha <- function(otu_counts_taxa_rows) {
+  if (is.null(dim(otu_counts_taxa_rows)) || ncol(otu_counts_taxa_rows) == 0) {
+    stop("OTU table is empty after preprocessing; cannot compute alpha diversity.")
+  }
+
+  observed <- colSums(otu_counts_taxa_rows > 0, na.rm = TRUE)
+  totals <- colSums(otu_counts_taxa_rows, na.rm = TRUE)
+
+  shannon <- rep(NA_real_, length(totals))
+  simpson <- rep(NA_real_, length(totals))
+
+  positive_totals <- totals > 0
+  if (any(positive_totals)) {
+    idx <- which(positive_totals)
+    for (i in idx) {
+      p <- otu_counts_taxa_rows[, i] / totals[[i]]
+      p <- p[p > 0]
+      shannon[[i]] <- -sum(p * log(p))
+      simpson[[i]] <- 1 - sum(p^2)
+    }
+  }
+
+  out <- data.frame(
+    Observed = as.numeric(observed),
+    Shannon = as.numeric(shannon),
+    Simpson = as.numeric(simpson),
+    stringsAsFactors = FALSE
+  )
+  rownames(out) <- colnames(otu_counts_taxa_rows)
+  out
+}
+
 
 
 # --- Main Function Dispatcher ---
@@ -346,7 +433,36 @@ microassist_alpha_insights_gemini <- function(ps,
   if (!inherits(ps, "phyloseq")) stop("Input 'ps' must be a phyloseq object.")
   api_key <- microassist_get_api_key(google_api_key, api_key_file)
 
-  alpha_df <- phyloseq::estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson", "Chao1", "ACE"))
+  alpha_input <- microassist_prepare_alpha_input(ps)
+  alpha_df <- if (isTRUE(alpha_input$use_basic_only)) {
+    alpha_input$note <- paste(
+      alpha_input$note,
+      "Using direct computation for Observed/Shannon/Simpson to avoid integer-only estimators.",
+      sep = " "
+    )
+    microassist_compute_basic_alpha(alpha_input$otu_counts_taxa_rows)
+  } else {
+    tryCatch(
+      phyloseq::estimate_richness(alpha_input$ps, measures = alpha_input$measures),
+      error = function(e) {
+        err_msg <- conditionMessage(e)
+        integer_error <- grepl("function accepts only integers \\(counts\\)", err_msg, ignore.case = TRUE)
+        if (!integer_error) {
+          stop(e)
+        }
+
+        alpha_input$note <<- paste(
+          alpha_input$note,
+          "estimate_richness raised an integer-count error; falling back to direct Observed/Shannon/Simpson computation.",
+          sep = " "
+        )
+        warning(alpha_input$note, call. = FALSE)
+
+        microassist_compute_basic_alpha(alpha_input$otu_counts_taxa_rows)
+      }
+    )
+  }
+  
   sample_df <- as.data.frame(sample_data(ps))
 
   selected_group_var <- microassist_choose_group_var(sample_df, requested_group_var = group_var)
@@ -354,15 +470,12 @@ microassist_alpha_insights_gemini <- function(ps,
   group_summary <- "No valid grouping variable available for alpha diversity grouping."
   if (!is.null(selected_group_var)) {
     alpha_df[[selected_group_var]] <- sample_df[[selected_group_var]]
+    metrics <- intersect(c("Observed", "Shannon", "Simpson", "Chao1", "ACE"), colnames(alpha_df))
     group_stats <- alpha_df %>%
       dplyr::group_by(.data[[selected_group_var]]) %>%
       dplyr::summarise(
         n = dplyr::n(),
-        Observed_mean = mean(Observed, na.rm = TRUE),
-        Shannon_mean = mean(Shannon, na.rm = TRUE),
-        Simpson_mean = mean(Simpson, na.rm = TRUE),
-        Chao1_mean = mean(Chao1, na.rm = TRUE),
-        ACE_mean = mean(ACE, na.rm = TRUE),
+        across(dplyr::all_of(metrics), ~mean(.x, na.rm = TRUE), .names = "{.col}_mean"),
         .groups = "drop"
       )
     group_summary <- paste(capture.output(print(group_stats)), collapse = "\n")
@@ -374,6 +487,7 @@ microassist_alpha_insights_gemini <- function(ps,
     "### Group Differences and Mechanisms\n\n",
     "### Hypotheses for Follow-Up\n\n",
     "Context: ", experimental_context, "\n\n",
+    "Alpha-metric note: ", alpha_input$note, "\n\n",
     "Overall alpha diversity summary:\n", paste(capture.output(summary(alpha_df)), collapse = "\n"), "\n\n",
     "Group summary:\n", group_summary
   )
@@ -393,7 +507,13 @@ microassist_alpha_insights_gemini <- function(ps,
 
   report_file <- microassist_save_report("microassist_alpha_diversity_insights", experimental_context, body)
 
-  list(insights = sections, alpha_metrics = alpha_df, grouping_variable = selected_group_var, report_file = report_file)
+ list(
+    insights = sections,
+    alpha_metrics = alpha_df,
+    alpha_metric_note = alpha_input$note,
+    grouping_variable = selected_group_var,
+    report_file = report_file
+  )
 }
 
 # --- Agent 3: Beta Diversity Insights ---
@@ -458,7 +578,7 @@ microassist_beta_insights_gemini <- function(ps,
 # --- Agent 4: Taxonomic Composition Insights ---
 microassist_taxonomic_insights_gemini <- function(ps,
                                                    experimental_context,
-                                                   rank = "Phylum",
+                                                   rank = "phylum", #or Phylum
                                                    top_n = 15,
                                                     group_var = NULL,
                                                    google_api_key = NULL,
@@ -521,6 +641,7 @@ microassist_taxonomic_insights_gemini <- function(ps,
   prompt <- paste0(
     "You are an expert in microbiome taxonomic interpretation. Return markdown only with sections:\n",
     "### Dominant Taxa and Biological Roles\n\n",
+    "### Deviations from Expected Composition\n\n",
     "### Group-Level Taxonomic Differences\n\n",
     "### Priority Taxa for Investigation\n\n",
     "Context: ", experimental_context, "\n",
@@ -533,12 +654,13 @@ microassist_taxonomic_insights_gemini <- function(ps,
   llm_text <- microassist_call_gemini(prompt, api_key, model_name, temperature, max_output_tokens)
   sections <- microassist_extract_sections(
     llm_text,
-    c("Dominant Taxa and Biological Roles", "Group-Level Taxonomic Differences", "Priority Taxa for Investigation")
+    c("Dominant Taxa and Biological Roles", "Deviations from Expected Composition", "Group-Level Taxonomic Differences", "Priority Taxa for Investigation")
   )
 
   body <- paste0(
     "--- Taxonomic Composition Insights ---\n\n",
     "### Dominant Taxa and Biological Roles\n", sections[["Dominant Taxa and Biological Roles"]], "\n\n",
+    "### Deviations from Expected Composition\n", sections[["Deviations from Expected Composition"]], "\n\n",
     "### Group-Level Taxonomic Differences\n", sections[["Group-Level Taxonomic Differences"]], "\n\n",
     "### Priority Taxa for Investigation\n", sections[["Priority Taxa for Investigation"]]
   )
