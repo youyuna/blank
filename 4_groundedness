@@ -19,45 +19,69 @@ if (!exists("out")) {
   stop("Object 'out' was not found. Run the runagents pipeline first so integrated report outputs exist.")
 }
 
-# Rank preference:
-# - if taxonomic agent already ran, use that rank
-# - otherwise default to 'Genus' if present, else first available rank
+# Rank preference for this groundedness check:
+# - force Phylum-level if available
+# - else fall back to first available rank
 available_ranks <- phyloseq::rank_names(ps_example)
-preferred_rank <- if (!is.null(out$tax_result$rank)) out$tax_result$rank else "Genus"
-if (!(preferred_rank %in% available_ranks)) {
-  preferred_rank <- if ("Genus" %in% available_ranks) "Genus" else available_ranks[[1]]
-}
+preferred_rank <- if ("Phylum" %in% available_ranks) "Phylum" else if ("phylum" %in% available_ranks) "phylum" else available_ranks[[1]]
 
 tax_df <- as.data.frame(phyloseq::tax_table(ps_example))
-original_microbe_list_from_phyloseq <- unique(trimws(as.character(tax_df[[preferred_rank]])))
-original_microbe_list_from_phyloseq <- original_microbe_list_from_phyloseq[
-  !is.na(original_microbe_list_from_phyloseq) &
-    original_microbe_list_from_phyloseq != "" &
-    original_microbe_list_from_phyloseq != "NA"
+normalize_taxon <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("^['\"`]|['\"`]$", "", x)
+  x <- gsub("^[Pp]__+", "", x) # remove p__ prefixes
+  x <- gsub("[^A-Za-z0-9_-]", "", x)
+  x <- tolower(x)
+  x
+}
+
+original_microbe_list_from_phyloseq_raw <- unique(trimws(as.character(tax_df[[preferred_rank]])))
+original_microbe_list_from_phyloseq_raw <- original_microbe_list_from_phyloseq_raw[
+  !is.na(original_microbe_list_from_phyloseq_raw) &
+    original_microbe_list_from_phyloseq_raw != "" &
+    original_microbe_list_from_phyloseq_raw != "NA"
 ]
+reference_list <- sort(unique(normalize_taxon(original_microbe_list_from_phyloseq_raw)))
+reference_list <- reference_list[reference_list != ""]
 
 # Gather all integrated-report text blocks and detect mentioned microbes by exact string match
 integrated_sections <- unlist(out$integrated_result$sections, use.names = FALSE)
 embedded_sections <- unlist(out$integrated_result$embedded_agent_reports, use.names = FALSE)
 all_integrated_text <- paste(c(integrated_sections, embedded_sections), collapse = "\n\n")
 
-mentioned_idx <- vapply(
-  original_microbe_list_from_phyloseq,
-  function(taxon) {
-    grepl(tolower(taxon), tolower(all_integrated_text), fixed = TRUE)
-  },
-  logical(1)
-)
-integrated_report_microbe_list <- original_microbe_list_from_phyloseq[mentioned_idx]
+# Extract phylum-like tokens from report text (not limited to the reference list)
+extract_report_phyla <- function(text_blob) {
+  # Candidate words with phylum-like suffixes in microbiome reports
+  rx <- "\\b([A-Za-z][A-Za-z0-9_-]{2,}(?:bacteria|ota|mycota|archaeota))\\b"
+  m <- regmatches(text_blob, gregexpr(rx, text_blob, perl = TRUE, ignore.case = TRUE))
+  raw <- if (length(m) > 0) unlist(m, use.names = FALSE) else character(0)
+
+  # Also catch explicit p__Phylum labels if present
+  rx_pref <- "\\bp__([A-Za-z][A-Za-z0-9_-]{2,})\\b"
+  m_pref <- regmatches(text_blob, gregexpr(rx_pref, text_blob, perl = TRUE, ignore.case = TRUE))
+  raw_pref <- if (length(m_pref) > 0) gsub("^[Pp]__+", "", unlist(m_pref, use.names = FALSE)) else character(0)
+
+  sort(unique(normalize_taxon(c(raw, raw_pref))))
+}
+
+report_phyla_all <- extract_report_phyla(all_integrated_text)
+
+# Keep a reference-constrained list too, for direct overlap accounting
+integrated_report_microbe_list <- sort(unique(intersect(report_phyla_all, reference_list)))
+integrated_report_microbe_list_all_mentions <- report_phyla_all
 
 # Keep two explicit objects requested by user
 reference_name <- "original_microbe_list_from_phyloseq"
-reference_list <- original_microbe_list_from_phyloseq
 experiment_lists <- list(integrated_report_microbe_list = integrated_report_microbe_list)
+if (length(integrated_report_microbe_list_all_mentions) > 0) {
+  experiment_lists[["integrated_report_microbe_list_all_mentions"]] <- integrated_report_microbe_list_all_mentions
+}
 
 print(paste("Selected taxonomic rank for original list:", preferred_rank))
-print(paste("Original microbe list size:", length(original_microbe_list_from_phyloseq)))
+print(paste("Original microbe list size:", length(reference_list)))
 print(paste("Integrated report microbe list size:", length(integrated_report_microbe_list)))
+print(paste("Integrated report phylum mentions (all) size:", length(integrated_report_microbe_list_all_mentions)))
+
 
 # Function to calculate overlap, unique taxa, groundedness score, and unique taxa list
 calculate_overlap_and_unique_microbes <- function(reference_list, experiment_list) {
