@@ -1,0 +1,168 @@
+```{r groundedness-assessment-microbiome}
+# Groundedness assessment (microbiome-focused)
+# This is intentionally a separate chunk and does not modify prior chunks.
+
+if (!requireNamespace("pheatmap", quietly = TRUE)) {
+  stop("Package 'pheatmap' is required for heatmap plotting. Install with install.packages('pheatmap').")
+}
+
+# Build groundedness inputs directly from objects already created in this workflow:
+# 1) original_microbe_list_from_phyloseq
+# 2) integrated_report_microbe_list
+#
+# This avoids external file dependencies and uses your in-memory phyloseq + report outputs.
+
+if (!exists("ps_example")) {
+  stop("Object 'ps_example' was not found. Run preprocessing / setup chunk first.")
+}
+if (!exists("out")) {
+  stop("Object 'out' was not found. Run the runagents pipeline first so integrated report outputs exist.")
+}
+
+# Rank preference:
+# - if taxonomic agent already ran, use that rank
+# - otherwise default to 'Genus' if present, else first available rank
+available_ranks <- phyloseq::rank_names(ps_example)
+preferred_rank <- if (!is.null(out$tax_result$rank)) out$tax_result$rank else "Genus"
+if (!(preferred_rank %in% available_ranks)) {
+  preferred_rank <- if ("Genus" %in% available_ranks) "Genus" else available_ranks[[1]]
+}
+
+tax_df <- as.data.frame(phyloseq::tax_table(ps_example))
+original_microbe_list_from_phyloseq <- unique(trimws(as.character(tax_df[[preferred_rank]])))
+original_microbe_list_from_phyloseq <- original_microbe_list_from_phyloseq[
+  !is.na(original_microbe_list_from_phyloseq) &
+    original_microbe_list_from_phyloseq != "" &
+    original_microbe_list_from_phyloseq != "NA"
+]
+
+# Gather all integrated-report text blocks and detect mentioned microbes by exact string match
+integrated_sections <- unlist(out$integrated_result$sections, use.names = FALSE)
+embedded_sections <- unlist(out$integrated_result$embedded_agent_reports, use.names = FALSE)
+all_integrated_text <- paste(c(integrated_sections, embedded_sections), collapse = "\n\n")
+
+mentioned_idx <- vapply(
+  original_microbe_list_from_phyloseq,
+  function(taxon) {
+    grepl(tolower(taxon), tolower(all_integrated_text), fixed = TRUE)
+  },
+  logical(1)
+)
+integrated_report_microbe_list <- original_microbe_list_from_phyloseq[mentioned_idx]
+
+# Keep two explicit objects requested by user
+reference_name <- "original_microbe_list_from_phyloseq"
+reference_list <- original_microbe_list_from_phyloseq
+experiment_lists <- list(integrated_report_microbe_list = integrated_report_microbe_list)
+
+print(paste("Selected taxonomic rank for original list:", preferred_rank))
+print(paste("Original microbe list size:", length(original_microbe_list_from_phyloseq)))
+print(paste("Integrated report microbe list size:", length(integrated_report_microbe_list)))
+
+# Function to calculate overlap, unique taxa, groundedness score, and unique taxa list
+calculate_overlap_and_unique_microbes <- function(reference_list, experiment_list) {
+  overlap <- length(intersect(reference_list, experiment_list))
+  unique_taxa <- length(setdiff(experiment_list, reference_list))
+  groundedness_score <- if ((overlap + unique_taxa) == 0) {
+    NA_real_
+  } else {
+    (overlap / (overlap + unique_taxa)) * 100
+  }
+  unique_taxa_list <- setdiff(experiment_list, reference_list)
+
+  list(
+    Overlap = overlap,
+    UniqueTaxa = unique_taxa,
+    GroundednessScore = groundedness_score,
+    UniqueTaxaList = unique_taxa_list
+  )
+}
+
+# Calculate overlap between reference list and each experiment list
+reference_results <- lapply(
+  experiment_lists,
+  function(x) calculate_overlap_and_unique_microbes(reference_list, x)
+)
+
+print(paste("Reference microbiome list:", reference_name))
+print("Overlap and Unique Taxa between Reference List and each Experiment List:")
+reference_overlaps <- data.frame(
+  ExperimentList = names(experiment_lists),
+  Overlap = sapply(reference_results, function(x) x$Overlap),
+  UniqueTaxa = sapply(reference_results, function(x) x$UniqueTaxa),
+  GroundednessScore = round(sapply(reference_results, function(x) x$GroundednessScore), 2),
+  stringsAsFactors = FALSE
+)
+print(reference_overlaps)
+
+# Store unique taxa lists
+unique_taxa_lists <- lapply(reference_results, function(x) x$UniqueTaxaList)
+names(unique_taxa_lists) <- names(experiment_lists)
+
+# Print unique taxa lists
+for (i in seq_along(unique_taxa_lists)) {
+  print(paste("Unique taxa for", names(unique_taxa_lists)[i]))
+  print(unique_taxa_lists[[i]])
+}
+
+# Pairwise overlap between each pair of experiment lists
+n <- length(experiment_lists)
+experiment_overlaps <- matrix(0, nrow = n, ncol = n)
+
+for (i in seq_len(n)) {
+  for (j in seq_len(n)) {
+    if (i == j) {
+      experiment_overlaps[i, j] <- length(experiment_lists[[i]])
+    } else if (i < j) {
+      overlap <- length(intersect(experiment_lists[[i]], experiment_lists[[j]]))
+      experiment_overlaps[i, j] <- overlap
+      experiment_overlaps[j, i] <- overlap
+    }
+  }
+}
+
+# Percent overlap using max list size from each pair as denominator
+denom_mat <- outer(
+  seq_len(n),
+  seq_len(n),
+  Vectorize(function(i, j) max(length(experiment_lists[[i]]), length(experiment_lists[[j]]), 1))
+)
+experiment_percent_overlap <- round((experiment_overlaps / denom_mat) * 100)
+diag(experiment_percent_overlap) <- 100
+
+rownames(experiment_percent_overlap) <- names(experiment_lists)
+colnames(experiment_percent_overlap) <- names(experiment_lists)
+
+# Visualize matrix as heatmap with percentage labels (only when informative)
+if (n > 1 && length(unique(as.vector(experiment_percent_overlap))) > 1) {
+  pheatmap::pheatmap(
+    experiment_percent_overlap,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    main = "Percent Overlap Between Experiment Microbiome Lists",
+    color = colorRampPalette(c("blue", "red"))(100),
+    display_numbers = experiment_percent_overlap,
+    number_format = "%d",
+    number_color = "white"
+  )
+} else {
+  print("Heatmap skipped: need >=2 experiment lists with non-constant overlap values.")
+  print(experiment_percent_overlap)
+}
+
+print("Overlap between each pair of Experiment Lists:")
+if (n > 1) {
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      print(paste(
+        names(experiment_lists)[i], "vs", names(experiment_lists)[j],
+        ": overlap =", experiment_overlaps[i, j]
+      ))
+    }
+  }
+} else {
+  print("Only one experiment list supplied (integrated_report_microbe_list); pairwise comparison skipped.")
+}
+```
