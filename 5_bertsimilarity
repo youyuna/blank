@@ -1,56 +1,96 @@
-#bert_similarity.py
-from transformers import BertTokenizer, BertModel
+# bertsimilarity2.py
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import List
+
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
-import random
+
+from transformers import BertModel, BertTokenizer
 
 
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-model = BertModel.from_pretrained("bert-base-uncased")
+def read_pdf_text(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ImportError("Reading PDF requires 'pypdf'. Install with: pip install pypdf") from exc
 
-with open("sentence1.txt", "r") as f:
-    sentence1 = f.read().strip()
+    reader = PdfReader(str(path))
+    pages = []
+    for page in reader.pages:
+        txt = page.extract_text() or ""
+        pages.append(txt)
+    return "\n".join(pages).strip()
 
-with open("sentence2.txt", "r") as f:
-    sentence2 = f.read().strip()
 
-# Tokenize the sentences
-tokens1 = tokenizer.tokenize(sentence1)
-tokens2 = tokenizer.tokenize(sentence2)
+def read_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return read_pdf_text(path)
+    return path.read_text(encoding="utf-8", errors="ignore").strip()
 
-# Add [CLS] and [SEP] tokens
-tokens1 = ['[CLS]'] + tokens1 + ['[SEP]']
-tokens2 = ['[CLS]'] + tokens2 + ['[SEP]']
 
-# Segment the tokens into chunks
-max_length = 512
-chunk_size = max_length - 2  # Account for [CLS] and [SEP]
-chunks1 = [tokens1[i:i + chunk_size] for i in range(0, len(tokens1), chunk_size)]
-chunks2 = [tokens2[i:i + chunk_size] for i in range(0, len(tokens2), chunk_size)]
+def chunk_tokens(token_ids: List[int], chunk_size: int = 510) -> List[List[int]]:
+    if not token_ids:
+        return []
+    return [token_ids[i:i + chunk_size] for i in range(0, len(token_ids), chunk_size)]
 
-# Process each chunk
-embeddings1 = []
-embeddings2 = []
-for chunk1, chunk2 in zip(chunks1, chunks2):
-    # Add [CLS] and [SEP] tokens
-    chunk1 = ['[CLS]'] + chunk1 + ['[SEP]']
-    chunk2 = ['[CLS]'] + chunk2 + ['[SEP]']
 
-    # Convert tokens to input IDs
-    input_ids1 = torch.tensor(tokenizer.convert_tokens_to_ids(chunk1)).unsqueeze(0)
-    input_ids2 = torch.tensor(tokenizer.convert_tokens_to_ids(chunk2)).unsqueeze(0)
+def embed_document(text: str, tokenizer: BertTokenizer, model: BertModel) -> torch.Tensor:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    chunks = chunk_tokens(token_ids, chunk_size=510)  # 510 + CLS/SEP = 512
 
-    # Obtain the BERT embeddings
-    with torch.no_grad():
-        outputs1 = model(input_ids1)
-        outputs2 = model(input_ids2)
-        embeddings1.append(outputs1.last_hidden_state[:, 0, :])
-        embeddings2.append(outputs2.last_hidden_state[:, 0, :])
+    if not chunks:
+        chunks = [[tokenizer.unk_token_id]]
 
-# Concatenate the embeddings from all chunks
-embeddings1 = torch.cat(embeddings1, dim=0)
-embeddings2 = torch.cat(embeddings2, dim=0)
+    cls_vectors = []
+    for ch in chunks:
+        input_ids = [tokenizer.cls_token_id] + ch + [tokenizer.sep_token_id]
+        attn = [1] * len(input_ids)
 
-# Calculate similarity
-similarity_score = cosine_similarity(embeddings1, embeddings2)
-print("Similarity Score:", similarity_score)
+        ids_tensor = torch.tensor([input_ids])
+        attn_tensor = torch.tensor([attn])
+
+        with torch.no_grad():
+            out = model(input_ids=ids_tensor, attention_mask=attn_tensor)
+            cls_vectors.append(out.last_hidden_state[:, 0, :])
+
+    doc_embedding = torch.cat(cls_vectors, dim=0).mean(dim=0, keepdim=True)
+    return doc_embedding
+
+#file1 is the reference paper
+#file 2 is the integrated report output
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Compute BERT cosine similarity between two .txt or .pdf documents."
+    )
+    parser.add_argument("file1", nargs="?", default="Covid_Paper.pdf", help="First input file (.txt or .pdf)")
+    parser.add_argument("file2", nargs="?", default="Microassist_Output_20260327_145041/microassist_integrated_analysis_report_20260327_145128.txt", help="Second input file (.txt or .pdf)")
+    args = parser.parse_args()
+
+    p1 = Path(args.file1)
+    p2 = Path(args.file2)
+    if not p1.exists():
+        raise FileNotFoundError(f"File not found: {p1}")
+    if not p2.exists():
+        raise FileNotFoundError(f"File not found: {p2}")
+
+    text1 = read_text(p1)
+    text2 = read_text(p2)
+
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    model = BertModel.from_pretrained("bert-base-uncased")
+    model.eval()
+
+    emb1 = embed_document(text1, tokenizer, model)
+    emb2 = embed_document(text2, tokenizer, model)
+
+    similarity_score = cosine_similarity(emb1.numpy(), emb2.numpy())[0][0]
+    print(f"Similarity Score: {similarity_score:.6f}")
+
+
+if __name__ == "__main__":
+    main()
