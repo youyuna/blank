@@ -254,6 +254,46 @@ microassist_safe_filename <- function(x) {
   ifelse(nchar(out) == 0, "untitled", out)
 }
 
+microassist_clean_taxon_label <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[is.na(x) | x == ""] <- NA_character_
+  x <- gsub("^[A-Za-z]__", "", x)
+  x <- gsub("\\bsp\\d+\\b", "", x, ignore.case = TRUE)
+  x <- gsub("[()\\[\\]\\{\\}]", " ", x)
+  x <- gsub("\\s+", " ", x)
+  x <- trimws(x)
+  x[x == "" | grepl("^sp\\d+$", x, ignore.case = TRUE)] <- NA_character_
+  x
+}
+
+microassist_resolve_taxon_labels <- function(taxa_df,
+                                             ids,
+                                             preferred_rank = NULL,
+                                             fallback = NA_character_) {
+  if (is.null(taxa_df) || nrow(taxa_df) == 0 || length(ids) == 0) {
+    return(rep(fallback, length(ids)))
+  }
+
+  ranks <- colnames(taxa_df)
+  rank_order <- unique(c(preferred_rank, ranks))
+  rank_order <- rank_order[rank_order %in% ranks]
+  if (length(rank_order) == 0) {
+    return(rep(fallback, length(ids)))
+  }
+
+  labels <- vapply(ids, function(id) {
+    if (!(id %in% rownames(taxa_df))) return(fallback)
+    candidates <- as.character(taxa_df[id, rank_order, drop = TRUE])
+    candidates <- microassist_clean_taxon_label(candidates)
+    candidates <- candidates[!is.na(candidates)]
+    if (length(candidates) == 0) fallback else candidates[[1]]
+  }, character(1))
+
+  labels[is.na(labels) | labels == ""] <- fallback
+  labels
+}
+
 microassist_write_intermediate_results <- function(prefix,
                                                    named_objects,
                                                    output_dir = ".") {
@@ -323,17 +363,58 @@ microassist_write_html_report <- function(prefix,
     non_session_names <- non_session_names[-session_idx[[1]]]
   }
 
-  section_html <- paste(vapply(non_session_names, function(h) {
-    body <- esc(sections[[h]])
+  build_section <- function(h, txt) {
     anchor <- microassist_safe_filename(tolower(h))
-    body <- gsub("\n", "<br/>", body)
-    paste0("<section id=\"", anchor, "\"><h3>", esc(h), "</h3><p>", body, "</p></section>")
-  }, character(1)), collapse = "\n")
+    lines <- unlist(strsplit(txt, "\n", fixed = TRUE))
+    sub_idx <- grep("^\\s*###\\s+", lines)
+    sub_items <- character(0)
+
+    if (length(sub_idx) == 0) {
+      body <- gsub("\n", "<br/>", esc(txt))
+      html <- paste0("<section id=\"", anchor, "\"><h3>", esc(h), "</h3><p>", body, "</p></section>")
+      return(list(html = html, toc = sub_items, anchor = anchor))
+    }
+
+    pieces <- c()
+    intro <- if (sub_idx[[1]] > 1) paste(lines[1:(sub_idx[[1]] - 1)], collapse = "\n") else ""
+    if (nchar(trimws(intro)) > 0) {
+      pieces <- c(pieces, paste0("<p>", gsub("\n", "<br/>", esc(intro)), "</p>"))
+    }
+
+    for (i in seq_along(sub_idx)) {
+      start <- sub_idx[[i]]
+      end <- if (i < length(sub_idx)) sub_idx[[i + 1]] - 1 else length(lines)
+      sub_h <- trimws(sub("^\\s*###\\s+", "", lines[[start]]))
+      sub_body <- if (start + 1 <= end) paste(lines[(start + 1):end], collapse = "\n") else ""
+      sub_anchor <- paste0(anchor, "__", microassist_safe_filename(tolower(sub_h)))
+      sub_items <- c(sub_items, paste0("<li><a href=\"#", sub_anchor, "\">", esc(sub_h), "</a></li>"))
+      pieces <- c(
+        pieces,
+        paste0(
+          "<section id=\"", sub_anchor, "\"><h4>", esc(sub_h), "</h4><p>",
+          gsub("\n", "<br/>", esc(sub_body)),
+          "</p></section>"
+        )
+      )
+    }
+
+    html <- paste0("<section id=\"", anchor, "\"><h3>", esc(h), "</h3>", paste(pieces, collapse = "\n"), "</section>")
+    list(html = html, toc = sub_items, anchor = anchor)
+  }
+
+  rendered <- lapply(non_session_names, function(h) build_section(h, sections[[h]]))
+  names(rendered) <- non_session_names
+  section_html <- paste(vapply(rendered, function(x) x$html, character(1)), collapse = "\n")
 
   toc_items <- paste(vapply(non_session_names, function(h) {
-    anchor <- microassist_safe_filename(tolower(h))
-    paste0("<li><a href=\"#", anchor, "\">", esc(h), "</a></li>")
+    main_anchor <- rendered[[h]]$anchor
+    sub_items <- rendered[[h]]$toc
+    sub_html <- if (length(sub_items) > 0) paste0("<ul>", paste(sub_items, collapse = ""), "</ul>") else ""
+    paste0("<li><a href=\"#", main_anchor, "\">", esc(h), "</a>", sub_html, "</li>")
   }, character(1)), collapse = "")
+  if (length(figure_paths) > 0) {
+    toc_items <- paste0(toc_items, "<li><a href=\"#figures\">Figures</a></li>")
+  }
   if (!is.null(session_section)) {
     toc_items <- paste0(
       toc_items,
@@ -342,15 +423,40 @@ microassist_write_html_report <- function(prefix,
   }
   toc_html <- paste0(
     "<details open><summary><strong>Table of Contents</strong></summary>",
-    "<ul>", toc_items, if (length(figure_paths) > 0) "<li><a href=\"#figures\">Figures</a></li>" else "",
-    "</ul></details>"
+    "<ul>", toc_items, "</ul></details>"
   )
 
   
   figure_html <- ""
   if (length(figure_paths) > 0) {
-    figure_blocks <- vapply(seq_along(figure_paths), function(i) {
+    figure_dir <- file.path(output_dir, "figures")
+    dir.create(figure_dir, showWarnings = FALSE, recursive = TRUE)
+    figure_sources <- vapply(seq_along(figure_paths), function(i) {
       fp <- figure_paths[[i]]
+      if (file.exists(fp)) {
+        ext <- tools::file_ext(fp)
+        safe_name <- paste0("integrated_figure_", i, ifelse(nchar(ext) > 0, paste0(".", ext), ".png"))
+        dest <- file.path(figure_dir, safe_name)
+        file.copy(fp, dest, overwrite = TRUE)
+        return(file.path("figures", safe_name))
+      }
+      fp
+    }, character(1))
+    figure_dir <- file.path(output_dir, "figures")
+    dir.create(figure_dir, showWarnings = FALSE, recursive = TRUE)
+    figure_sources <- vapply(seq_along(figure_paths), function(i) {
+      fp <- figure_paths[[i]]
+      if (file.exists(fp)) {
+        ext <- tools::file_ext(fp)
+        safe_name <- paste0("integrated_figure_", i, ifelse(nchar(ext) > 0, paste0(".", ext), ".png"))
+        dest <- file.path(figure_dir, safe_name)
+        file.copy(fp, dest, overwrite = TRUE)
+        return(file.path("figures", safe_name))
+      }
+      fp
+    }, character(1))
+    figure_blocks <- vapply(seq_along(figure_sources), function(i) {
+      fp <- utils::URLencode(figure_sources[[i]])
       paste0(
         "<figure><img src=\"", fp, "\" alt=\"Integrated Figure ", i,
         "\" style=\"max-width: 100%; height: auto;\"/><figcaption>Integrated Figure ",
@@ -544,7 +650,8 @@ microassist_generate_integrated_figures <- function(alpha_result,
   try({
     tt <- taxonomic_result$top_table
     if (!is.null(tt) && nrow(tt) > 0) {
-      tt$taxon_label[is.na(tt$taxon_label) | tt$taxon_label == ""] <- tt$taxon_id[is.na(tt$taxon_label) | tt$taxon_label == ""]
+      tt <- tt[!is.na(tt$taxon_label) & tt$taxon_label != "", , drop = FALSE]
+      if (nrow(tt) == 0) stop("No resolved taxa labels available for Figure 3.")
       tt <- tt[order(tt$mean_relative_abundance, decreasing = TRUE), , drop = FALSE]
       tt$taxon_label <- factor(tt$taxon_label, levels = rev(tt$taxon_label))
       p <- ggplot(tt, aes(x = taxon_label, y = mean_relative_abundance)) +
@@ -558,28 +665,37 @@ microassist_generate_integrated_figures <- function(alpha_result,
     }
   }, silent = TRUE)
 
-  # Figure 4: top 15 phyla by group (single shared taxa panel, grouped bars)
+  # Figure 4: top 15 phyla by group (faceted by group)
   try({
     gtt <- taxonomic_result$group_top_table
-    tt <- taxonomic_result$top_table
     gvar <- taxonomic_result$grouping_variable
-    if (!is.null(gtt) && nrow(gtt) > 0 && !is.null(tt) && nrow(tt) > 0 &&
-        !is.null(gvar) && gvar %in% colnames(gtt)) {
-      tt <- tt[order(tt$mean_relative_abundance, decreasing = TRUE), , drop = FALSE]
-      top15_ids <- head(tt$taxon_id, 15)
-      gtt <- gtt[gtt$taxon_id %in% top15_ids, , drop = FALSE]
-      gtt$taxon_label[is.na(gtt$taxon_label) | gtt$taxon_label == ""] <- gtt$taxon_id[is.na(gtt$taxon_label) | gtt$taxon_label == ""]
-      top15_labels <- tt$taxon_label
-      top15_labels[is.na(top15_labels) | top15_labels == ""] <- tt$taxon_id[is.na(top15_labels) | top15_labels == ""]
-      top15_labels <- top15_labels[tt$taxon_id %in% top15_ids]
-      gtt$taxon_label <- factor(gtt$taxon_label, levels = rev(unique(top15_labels)))
-      p <- ggplot(gtt, aes(x = taxon_label, y = mean_relative_abundance, fill = .data[[gvar]])) +
-        geom_col(position = position_dodge(width = 0.9)) +
+    if (!is.null(gtt) && nrow(gtt) > 0 && !is.null(gvar) && gvar %in% colnames(gtt)) {
+      gtt <- gtt[!is.na(gtt$taxon_label) & gtt$taxon_label != "", , drop = FALSE]
+      gtt[[gvar]] <- as.character(gtt[[gvar]])
+      gtt <- gtt[!is.na(gtt[[gvar]]) & gtt[[gvar]] != "", , drop = FALSE]
+      if (nrow(gtt) == 0) stop("No valid grouped taxa rows available for Figure 4.")
+
+      by_group <- split(gtt, gtt[[gvar]])
+      gtt_top <- do.call(rbind, lapply(by_group, function(df) {
+        df <- df[order(df$mean_relative_abundance, decreasing = TRUE), , drop = FALSE]
+        utils::head(df, 15)
+      }))
+      if (is.null(gtt_top) || nrow(gtt_top) == 0) stop("No top grouped taxa available for Figure 4.")
+
+      gtt_top[[gvar]] <- factor(gtt_top[[gvar]], levels = names(by_group))
+      gtt_top$taxon_label <- factor(gtt_top$taxon_label)
+      p <- ggplot(gtt_top, aes(x = reorder(taxon_label, mean_relative_abundance), y = mean_relative_abundance)) +
+        geom_col(fill = "#0ea5e9") +
         coord_flip() +
+        facet_wrap(stats::as.formula(paste("~", gvar)), scales = "free_y") +
         theme_bw() +
-        labs(title = "Top 15 Phyla by Group", x = "Phylum", y = "Mean Relative Abundance", fill = gvar)
+        labs(
+          title = paste0("Top 15 Phyla by ", gvar),
+          x = "Phylum",
+          y = "Mean Relative Abundance"
+        )
       fp <- file.path(output_dir, paste0(prefix, "_taxa_by_group_", stamp, ".png"))
-      ggsave(fp, p, width = 8, height = 6, dpi = 150)
+      ggsave(fp, p, width = 12, height = 8, dpi = 150)
       out <- c(out, fp)
     }
   }, silent = TRUE)
@@ -645,10 +761,19 @@ microassist_build_taxa_interaction_network <- function(ps,
 
   node_table <- data.frame(
     taxon_id = keep_ids,
-    taxon_label = as.character(taxa_df[keep_ids, chosen_rank, drop = TRUE]),
+    taxon_label = microassist_resolve_taxon_labels(taxa_df, keep_ids, preferred_rank = chosen_rank),
     mean_relative_abundance = as.numeric(mean_abundance[keep_ids]),
     stringsAsFactors = FALSE
   )
+  node_table <- node_table[!is.na(node_table$taxon_label) & node_table$taxon_label != "", , drop = FALSE]
+  if (nrow(node_table) < 2) {
+    return(list(edge_table = data.frame(), node_table = node_table, figure_file = NULL, rank = chosen_rank))
+  }
+  edge_table <- edge_table[
+    edge_table$taxon_1 %in% node_table$taxon_id & edge_table$taxon_2 %in% node_table$taxon_id,
+    ,
+    drop = FALSE
+  ]
 
   fig_file <- NULL
   if (nrow(edge_table) > 0) {
@@ -658,7 +783,6 @@ microassist_build_taxa_interaction_network <- function(ps,
     coords <- cmdscale(dist_mat, k = 2)
     coord_df <- data.frame(taxon_id = rownames(coords), x = coords[, 1], y = coords[, 2], stringsAsFactors = FALSE)
     coord_df <- merge(coord_df, node_table, by = "taxon_id", all.x = TRUE)
-    coord_df$taxon_label[is.na(coord_df$taxon_label) | coord_df$taxon_label == ""] <- coord_df$taxon_id[is.na(coord_df$taxon_label) | coord_df$taxon_label == ""]
 
     edge_plot <- merge(edge_table, coord_df[, c("taxon_id", "x", "y")], by.x = "taxon_1", by.y = "taxon_id", all.x = TRUE)
     edge_plot <- merge(edge_plot, coord_df[, c("taxon_id", "x", "y")], by.x = "taxon_2", by.y = "taxon_id", all.x = TRUE, suffixes = c("_1", "_2"))
@@ -955,6 +1079,7 @@ microassist_beta_diversity_agent <- function(ps,
   if (!taxa_are_rows(ps)) otu <- t(otu)
   taxa_variance <- apply(otu, 1, var)
   top_taxa <- sort(taxa_variance, decreasing = TRUE)[1:min(20, length(taxa_variance))]
+  taxa_df <- as.data.frame(tax_table(ps))
 
   meta_df <- as.data.frame(sample_data(ps))
   selected_group_var <- microassist_choose_group_var(meta_df, requested_group_var = group_var)
@@ -982,6 +1107,16 @@ microassist_beta_diversity_agent <- function(ps,
   )
 
   top_taxa_small <- round(top_taxa[1:min(10, length(top_taxa))], 6)
+  top_taxa_labels <- microassist_resolve_taxon_labels(taxa_df, names(top_taxa_small))
+  top_taxa_df <- data.frame(
+    taxon_label = as.character(top_taxa_labels),
+    variance = as.numeric(top_taxa_small),
+    stringsAsFactors = FALSE
+  )
+  top_taxa_df <- top_taxa_df[!is.na(top_taxa_df$taxon_label) & top_taxa_df$taxon_label != "", , drop = FALSE]
+  if (nrow(top_taxa_df) == 0) {
+    top_taxa_df <- data.frame(taxon_label = "No resolved taxa labels", variance = NA_real_, stringsAsFactors = FALSE)
+  }
 
   prompt <- paste0(
     "You are a microbiome community ecology expert. Interpret beta diversity patterns and potential drivers. ",
@@ -995,7 +1130,7 @@ microassist_beta_diversity_agent <- function(ps,
     paste(names(round(dist_stats, 5)), round(dist_stats, 5), collapse = "; "), "\n",
     "Top PCoA eigenvalues: ", paste(eig_preview, collapse = ", "), "\n",
     "Top variable taxa (top 10 variance): ",
-    paste(names(top_taxa_small), top_taxa_small, collapse = "; "), "\n"
+    paste(top_taxa_df$taxon_label, round(top_taxa_df$variance, 6), collapse = "; "), "\n"
   )
 
   headers <- c("Community Similarity and Separation", "Likely Drivers (Taxa or Functions)", "Community-Structure Hypotheses")
@@ -1006,7 +1141,7 @@ microassist_beta_diversity_agent <- function(ps,
       group_line = group_line,
       distance_stats = as.data.frame(t(round(dist_stats, 6))),
       top_eigenvalues = data.frame(eigenvalue = as.numeric(eig_preview)),
-      top_variable_taxa = data.frame(taxon_id = names(top_taxa_small), variance = as.numeric(top_taxa_small), stringsAsFactors = FALSE),
+      top_variable_taxa = top_taxa_df,
       distance_matrix = dist_obj
     ),
     output_dir = output_dir
@@ -1026,7 +1161,7 @@ microassist_beta_diversity_agent <- function(ps,
     distance = dist_obj,
     ordination = ord,
     group_values = group_values,
-    top_variable_taxa = top_taxa,
+    top_variable_taxa = top_taxa_df,
     llm_input_files = llm_input_files,
     report_file = report_file
   )
@@ -1076,19 +1211,25 @@ microassist_taxonomic_composition_agent <- function(ps,
 
   taxa_df <- as.data.frame(tax_table(ps_rank))
   ids <- names(top_abundance)
-  labels <- taxa_df[ids, rank, drop = TRUE]
+  labels <- microassist_resolve_taxon_labels(taxa_df, ids, preferred_rank = rank)
 
   top_table <- data.frame(
-    taxon_id = ids,
     taxon_label = as.character(labels),
     mean_relative_abundance = as.numeric(top_abundance),
     stringsAsFactors = FALSE
   )
+  top_table <- top_table[!is.na(top_table$taxon_label) & top_table$taxon_label != "", , drop = FALSE]
   
   group_top_table <- data.frame()
   group_summary <- "No valid grouping variable available for group-level taxonomic analysis."
   if (!is.null(selected_group_var) && selected_group_var %in% colnames(meta_df)) {
-    aligned_group <- as.character(meta_df[rownames(otu_rank), selected_group_var, drop = TRUE])
+    sample_ids <- colnames(otu_rank)
+    matched_ids <- intersect(sample_ids, rownames(meta_df))
+    aligned_group <- rep(NA_character_, length(sample_ids))
+    names(aligned_group) <- sample_ids
+    if (length(matched_ids) > 0) {
+      aligned_group[matched_ids] <- as.character(meta_df[matched_ids, selected_group_var, drop = TRUE])
+    }
     group_levels <- unique(aligned_group[!is.na(aligned_group) & aligned_group != ""])
 
     group_tables <- lapply(group_levels, function(gl) {
@@ -1096,17 +1237,19 @@ microassist_taxonomic_composition_agent <- function(ps,
       grp_mean <- rowMeans(otu_rank[, idx, drop = FALSE], na.rm = TRUE)
       grp_top <- sort(grp_mean, decreasing = TRUE)[1:min(top_n, length(grp_mean))]
       grp_ids <- names(grp_top)
-      grp_labels <- taxa_df[grp_ids, rank, drop = TRUE]
-      data.frame(
+      grp_labels <- microassist_resolve_taxon_labels(taxa_df, grp_ids, preferred_rank = rank)
+      out <- data.frame(
         group = gl,
-        taxon_id = grp_ids,
         taxon_label = as.character(grp_labels),
         mean_relative_abundance = as.numeric(grp_top),
         stringsAsFactors = FALSE
       )
+      out <- out[!is.na(out$taxon_label) & out$taxon_label != "", , drop = FALSE]
+      out
     })
 
-    group_top_table <- do.call(rbind, group_tables)
+    group_tables <- group_tables[sapply(group_tables, nrow) > 0]
+    group_top_table <- if (length(group_tables) > 0) do.call(rbind, group_tables) else data.frame()
     if (!is.null(group_top_table) && nrow(group_top_table) > 0) {
       colnames(group_top_table)[colnames(group_top_table) == "group"] <- selected_group_var
       group_summary <- paste(capture.output(print(utils::head(group_top_table, 30))), collapse = "\n")
@@ -1434,5 +1577,6 @@ out <- microassist_run_next4_agents(
   api_key_file = "~/Documents/gemini_api_key_copy.txt"
 )
 str(out)
+
 
 ```
