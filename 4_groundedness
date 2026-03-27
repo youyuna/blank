@@ -1,4 +1,3 @@
-```{r groundedness-assessment-microbiome}
 # Groundedness assessment (microbiome-focused)
 # This is intentionally a separate chunk and does not modify prior chunks.
 
@@ -44,8 +43,9 @@ original_microbe_list_from_phyloseq_raw <- original_microbe_list_from_phyloseq_r
 reference_list <- sort(unique(normalize_taxon(original_microbe_list_from_phyloseq_raw)))
 reference_list <- reference_list[reference_list != ""]
 
-# Build integrated-result taxa list from structured outputs first (preferred),
-# with report-text extraction as a fallback.
+# Build integrated-result taxa list from integrated narrative sections only.
+# NOTE: We intentionally avoid out$tax_result$top_table here because that table can
+# include internal feature IDs (e.g., sp1563) that are not phylum names.
 extract_report_phyla <- function(text_blob) {
   # Candidate words with phylum-like suffixes in microbiome reports
   rx <- "\\b([A-Za-z][A-Za-z0-9_-]{2,}(?:bacteria|ota|mycota|archaeota))\\b"
@@ -56,43 +56,46 @@ extract_report_phyla <- function(text_blob) {
   rx_pref <- "\\bp__([A-Za-z][A-Za-z0-9_-]{2,})\\b"
   m_pref <- regmatches(text_blob, gregexpr(rx_pref, text_blob, perl = TRUE, ignore.case = TRUE))
   raw_pref <- if (length(m_pref) > 0) gsub("^[Pp]__+", "", unlist(m_pref, use.names = FALSE)) else character(0)
-
-  sort(unique(normalize_taxon(c(raw, raw_pref))))
+  
+  taxa <- sort(unique(normalize_taxon(c(raw, raw_pref))))
+  non_phylum_terms <- c("microbiota", "microbiome")
+  taxa[!(taxa %in% non_phylum_terms)]
 }
 
 # Gather all integrated-report text blocks and detect mentioned microbes by exact string match
-integrated_taxa_from_tables <- character(0)
-if (!is.null(out$tax_result) && !is.null(out$tax_result$top_table) && nrow(out$tax_result$top_table) > 0) {
-  # Prefer human-readable labels first, fallback to IDs
-  tt <- out$tax_result$top_table
-  taxa_candidates <- c(as.character(tt$taxon_label), as.character(tt$taxon_id))
-  integrated_taxa_from_tables <- normalize_taxon(taxa_candidates)
-  integrated_taxa_from_tables <- integrated_taxa_from_tables[integrated_taxa_from_tables != "" & integrated_taxa_from_tables != "na"]
-}
+integrated_sections <- unlist(out$integrated_result$sections, use.names = FALSE)
+embedded_sections <- unlist(out$integrated_result$embedded_agent_reports, use.names = FALSE)
+all_integrated_text <- paste(c(integrated_sections, embedded_sections), collapse = "\n\n")
+#all_integrated_text <- paste(integrated_sections, collapse = "\n\n")
 
-if (length(integrated_taxa_from_tables) > 0) {
-  integrated_report_microbe_list <- sort(unique(integrated_taxa_from_tables))
-  integrated_source <- "out$tax_result$top_table (structured taxa output)"
-} else {
-  integrated_sections <- unlist(out$integrated_result$sections, use.names = FALSE)
-  all_integrated_text <- paste(integrated_sections, collapse = "\n\n")
-  report_phyla_all <- extract_report_phyla(all_integrated_text)
-  integrated_report_microbe_list <- sort(unique(report_phyla_all))
-  integrated_source <- "out$integrated_result$sections (text-extracted taxa fallback)"
-}
+# Extract explicit phylum-like names from report text.
+report_phyla_all <- extract_report_phyla(all_integrated_text)
+
+# Also collect exact matches of known reference phyla mentioned in report text.
+reference_mentioned <- reference_list[
+  vapply(reference_list, function(tx) {
+    grepl(tx, tolower(all_integrated_text), fixed = TRUE)
+  }, logical(1))
+]
+
+integrated_report_microbe_list <- sort(unique(c(report_phyla_all, reference_mentioned)))
+integrated_report_microbe_list <- integrated_report_microbe_list[
+  integrated_report_microbe_list != "" & integrated_report_microbe_list != "na"
+]
+integrated_source <- "out$integrated_result$sections (text-extracted phylum mentions)"
 
 # Keep two explicit objects requested by user
 reference_name <- "original_microbe_list_from_phyloseq"
 experiment_lists <- list(integrated_report_microbe_list = integrated_report_microbe_list)
-if (length(integrated_report_microbe_list_all_mentions) > 0) {
-  experiment_lists[["integrated_report_microbe_list_all_mentions"]] <- integrated_report_microbe_list_all_mentions
-}
 
 print(paste("Selected taxonomic rank for original list:", preferred_rank))
 print(paste("Original microbe list size:", length(reference_list)))
 print(paste("Integrated report microbe list size:", length(integrated_report_microbe_list)))
 print(paste("Integrated taxa source:", integrated_source))
-
+print("reference_list taxa:")
+print(reference_list)
+print("integrated_report_microbe_list taxa:")
+print(integrated_report_microbe_list)
 
 # Function to calculate overlap, unique taxa, groundedness score, and unique taxa list
 calculate_overlap_and_unique_microbes <- function(reference_list, experiment_list) {
@@ -140,16 +143,20 @@ for (i in seq_along(unique_taxa_lists)) {
   print(unique_taxa_lists[[i]])
 }
 
-# Pairwise overlap between each pair of experiment lists
-n <- length(experiment_lists)
+# Pairwise overlap matrix between reference_list and integrated_report_microbe_list
+compare_lists <- list(
+  reference_list = reference_list,
+  integrated_report_microbe_list = integrated_report_microbe_list
+)
+n <- length(compare_lists)
 experiment_overlaps <- matrix(0, nrow = n, ncol = n)
 
 for (i in seq_len(n)) {
   for (j in seq_len(n)) {
     if (i == j) {
-      experiment_overlaps[i, j] <- length(experiment_lists[[i]])
+      experiment_overlaps[i, j] <- length(compare_lists[[i]])
     } else if (i < j) {
-      overlap <- length(intersect(experiment_lists[[i]], experiment_lists[[j]]))
+      overlap <- length(intersect(compare_lists[[i]], compare_lists[[j]]))
       experiment_overlaps[i, j] <- overlap
       experiment_overlaps[j, i] <- overlap
     }
@@ -160,16 +167,16 @@ for (i in seq_len(n)) {
 denom_mat <- outer(
   seq_len(n),
   seq_len(n),
-  Vectorize(function(i, j) max(length(experiment_lists[[i]]), length(experiment_lists[[j]]), 1))
+  Vectorize(function(i, j) max(length(compare_lists[[i]]), length(compare_lists[[j]]), 1))
 )
 experiment_percent_overlap <- round((experiment_overlaps / denom_mat) * 100)
 diag(experiment_percent_overlap) <- 100
 
-rownames(experiment_percent_overlap) <- names(experiment_lists)
-colnames(experiment_percent_overlap) <- names(experiment_lists)
+rownames(experiment_percent_overlap) <- names(compare_lists)
+colnames(experiment_percent_overlap) <- names(compare_lists)
 
-# Visualize matrix as heatmap with percentage labels (only when informative)
-if (n > 1 && length(unique(as.vector(experiment_percent_overlap))) > 1) {
+# Visualize matrix as heatmap with percentage labels
+if (n > 1) {
   pheatmap::pheatmap(
     experiment_percent_overlap,
     cluster_rows = FALSE,
@@ -183,21 +190,20 @@ if (n > 1 && length(unique(as.vector(experiment_percent_overlap))) > 1) {
     number_color = "white"
   )
 } else {
-  print("Heatmap skipped: need >=2 experiment lists with non-constant overlap values.")
+  print("Heatmap skipped: need >=2 lists.")
   print(experiment_percent_overlap)
 }
 
-print("Overlap between each pair of Experiment Lists:")
+print("Overlap between reference_list and integrated_report_microbe_list:")
 if (n > 1) {
   for (i in 1:(n - 1)) {
     for (j in (i + 1):n) {
       print(paste(
-        names(experiment_lists)[i], "vs", names(experiment_lists)[j],
+        names(compare_lists)[i], "vs", names(compare_lists)[j],
         ": overlap =", experiment_overlaps[i, j]
       ))
     }
   }
 } else {
-  print("Only one experiment list supplied (integrated_report_microbe_list); pairwise comparison skipped.")
+  print("Only one list supplied; pairwise comparison skipped.")
 }
-```
